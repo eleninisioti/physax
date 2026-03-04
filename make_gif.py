@@ -16,7 +16,7 @@ from jax import random
 from functools import partial
 from tqdm import trange
 
-from physax import make_config, init_population, cycle_step, save_grid_gif
+from physax import make_config, init_population, cycle_step, save_physis_view_gif, save_grid_gif
 
 # ── Parameters ────────────────────────────────────────────────────────
 GRID_SIDE = 16
@@ -26,11 +26,15 @@ SNAPSHOT_INTERVAL = 10  # capture every 10 cycles -> 100 frames
 SEED = 42
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "experiment_results", "physax_run.gif")
 
+# View mode: "all" (3-panel Fitness|Merit|Age), "fitness", "merit", "age", or "species" (HSV lineage)
+VIEW_MODE = "all"
+
 def main():
     print(f"=== Physax GIF Generator ===")
     print(f"Grid: {GRID_SIDE}x{GRID_SIDE} = {POP_SIZE} cells")
     print(f"Cycles: {N_CYCLES}, Snapshot every {SNAPSHOT_INTERVAL} cycles")
     print(f"Seed: {SEED}")
+    print(f"View mode: {VIEW_MODE}")
     print(f"Output: {OUTPUT_PATH}")
     print()
 
@@ -56,17 +60,23 @@ def main():
     print("JIT compiled.")
     print()
 
+    def capture_snapshot(pop, cycle_num):
+        return {
+            'cycle': cycle_num,
+            'alive': np.array(pop['alive']),
+            'genome_len': np.array(pop['genome_len']),
+            'color': np.array(pop['color']),
+            'age': np.array(pop['age']),
+            'executed': np.array(pop['executed']),
+            'gestation_time': np.array(pop['gestation_time']),
+        }
+
     # Run simulation, capturing snapshots
     snapshots = []
     cycle_keys = random.split(k2, N_CYCLES)
 
     # Capture initial state (cycle 0)
-    snapshots.append({
-        'cycle': 0,
-        'alive': np.array(pop['alive']),
-        'genome_len': np.array(pop['genome_len']),
-        'color': np.array(pop['color']),
-    })
+    snapshots.append(capture_snapshot(pop, 0))
 
     jit_step = jax.jit(cycle_step_fn)
 
@@ -75,14 +85,8 @@ def main():
 
         cycle_num = i + 1
         if cycle_num % SNAPSHOT_INTERVAL == 0:
-            # Block until ready before transferring to host
             pop_ready = jax.block_until_ready(pop)
-            snapshots.append({
-                'cycle': cycle_num,
-                'alive': np.array(pop_ready['alive']),
-                'genome_len': np.array(pop_ready['genome_len']),
-                'color': np.array(pop_ready['color']),
-            })
+            snapshots.append(capture_snapshot(pop_ready, cycle_num))
 
     print(f"\nCaptured {len(snapshots)} snapshots (cycle 0 + {len(snapshots)-1} during simulation)")
     pop_final = jax.block_until_ready(pop)
@@ -91,7 +95,10 @@ def main():
     print()
 
     # Generate GIF
-    save_grid_gif(snapshots, OUTPUT_PATH, cfg)
+    if VIEW_MODE == 'species':
+        save_grid_gif(snapshots, OUTPUT_PATH, cfg)
+    else:
+        save_physis_view_gif(snapshots, OUTPUT_PATH, cfg, VIEW_MODE)
     print("Done!")
 
 
