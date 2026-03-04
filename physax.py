@@ -1,13 +1,13 @@
 """
 Physis Minimal - JAX Version
 
+Faithful port of the original Physis/ARCHE universal processor.
 Parallelized digital evolution simulation using JAX.
 - Population runs in parallel via vmap
 - Cycles via lax.scan with interleaved birth handling
 - Fixed-size padded genomes for JAX compatibility
 """
 import os
-# CUDA_VISIBLE_DEVICES=0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import jax
@@ -26,7 +26,6 @@ except ImportError:
     imageio = None
 from PIL import Image
 
-
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -35,30 +34,105 @@ except ImportError:
 
 
 # ==========================================
-# 1. CONSTANTS (Gene values)
+# 1. CONSTANTS (Gene values — matching UP.java)
 # ==========================================
 
-R = 100
-S = 101
-B = 102
-I = 103
-SEP = 104
+NOP = 0
+IN = 1
+OUT = 2
+LOAD = 3
+STORE = 4
+MOVE = 5
+ALLOCATE = 6
+COMPARE = 7
+IFZERO = 8
+JUMP = 9
+DEC = 10
+INC = 11
+DIVIDE = 12
+SDIR = 13
+GDIR = 14
+SEND = 15
+RECEIVE = 16
+ADD = 17
+SUB = 18
+MUL = 19
+DIV_OP = 20
+MOD = 21
+AND = 22
+OR = 23
+XOR = 24
+NEG = 25
+NOT = 26
+SHIFT_L = 27
+SHIFT_R = 28
+FORK_TH = 29
+KILL_TH = 30
+R = 31
+S = 32
+Q = 33
+I = 34
+B = 35
+SEP = 36
+CLEAR = 37
+CINC = 38
+CDEC = 39
+IS_SEP = 40
+REL_LOAD = 41
+REL_STORE = 42
+IFNOTZERO = 43
 
-MOVE = 10
-LOAD = 11
-STORE = 12
-JUMP = 20
-IFZERO = 21
-INC = 30
-DEC = 31
-ADD = 32
-SUB = 33
-ALLOCATE = 40
-DIVIDE = 41
-READ_SIZE = 50
+UP_IS_SIZE = 44
+BLANK = -1
 
-NOP = -1
-EMPTY = -1
+# Number of operands for each opcode (index = opcode, 44 entries)
+# From the instruction set definition file
+N_OPERANDS = jnp.array([
+    0,  # 0: NOP
+    1,  # 1: IN
+    1,  # 2: OUT
+    2,  # 3: LOAD
+    2,  # 4: STORE
+    2,  # 5: MOVE
+    1,  # 6: ALLOCATE
+    3,  # 7: COMPARE
+    1,  # 8: IFZERO
+    1,  # 9: JUMP
+    1,  # 10: DEC
+    1,  # 11: INC
+    0,  # 12: DIVIDE
+    1,  # 13: SDIR
+    1,  # 14: GDIR
+    1,  # 15: SEND
+    1,  # 16: RECEIVE
+    3,  # 17: ADD
+    3,  # 18: SUB
+    3,  # 19: MUL
+    3,  # 20: DIV
+    3,  # 21: MOD
+    3,  # 22: AND
+    3,  # 23: OR
+    3,  # 24: XOR
+    2,  # 25: NEG
+    2,  # 26: NOT
+    2,  # 27: SHIFT_L
+    2,  # 28: SHIFT_R
+    1,  # 29: FORK_TH
+    0,  # 30: KILL_TH
+    0,  # 31: R
+    0,  # 32: S
+    0,  # 33: Q
+    0,  # 34: I
+    0,  # 35: B
+    0,  # 36: SEPARATOR
+    1,  # 37: CLEAR
+    1,  # 38: CINC
+    1,  # 39: CDEC
+    2,  # 40: IS_SEP
+    3,  # 41: REL_LOAD
+    3,  # 42: REL_STORE
+    1,  # 43: IFNOTZERO
+], dtype=jnp.int32)
 
 
 # ==========================================
@@ -67,18 +141,24 @@ EMPTY = -1
 
 class Config:
     """Simulation configuration with fixed sizes for JAX."""
-    max_genome_len: int = 128
-    max_registers: int = 8
-    max_instructions: int = 32
-    max_ops_per_instr: int = 16
+    max_genome_len: int = 256
+    max_se_count: int = 16
+    max_instructions: int = 64
+    max_micro_ops: int = 32
     pop_size: int = 1024
-    initial_pop: int = 16
-    max_age: int = 40000  # In cycles
-    
-    point_mutation_rate: float = 0.01
-    indel_rate: float = 0.005
+    initial_pop: int = 1
+
+    steps_per_update: int = 34
+    copy_mutation_rate: float = 0.009
+    divide_mutation_rate: float = 0.0
+    divide_insert_rate: float = 0.0013
+    divide_delete_rate: float = 0.0013
+    min_allocation_ratio: float = 0.5
+    max_allocation_ratio: float = 2.0
+    min_proliferation_ratio: float = 0.80
+
     use_species_color: bool = True
-    
+
 
 def make_config(**kwargs) -> Config:
     """Create config with optional overrides."""
@@ -95,23 +175,33 @@ def make_config(**kwargs) -> Config:
 def create_organism_state(cfg: Config):
     """Create empty organism state arrays."""
     return {
-        'genome': jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32),
+        'genome': jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32),
         'genome_len': jnp.int32(0),
-        'registers': jnp.zeros(cfg.max_registers, dtype=jnp.int32),
-        'ip': jnp.int32(0),
-        'code_start': jnp.int32(0),
-        'n_regs': jnp.int32(1),
+        # Structural elements: SE[0] = IP, SE[1..] = registers/stacks/queues
+        'se_values': jnp.zeros(cfg.max_se_count, dtype=jnp.int32),
+        'n_ses': jnp.int32(1),  # At least IP
+        'separator_pos': jnp.int32(0),
         'n_instructions': jnp.int32(0),
+        # Instruction table: raw normalized micro-ops per instruction
+        'instruction_table': jnp.full((cfg.max_instructions, cfg.max_micro_ops), BLANK, dtype=jnp.int32),
+        'instruction_lengths': jnp.zeros(cfg.max_instructions, dtype=jnp.int32),
+        # Child allocation
+        'child': jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32),
+        'child_len': jnp.int32(0),
+        'child_copied': jnp.zeros(cfg.max_genome_len, dtype=jnp.bool_),
+        'already_allocated': jnp.bool_(False),
+        # Execution state
         'age': jnp.int32(0),
         'alive': jnp.bool_(True),
         'has_child': jnp.bool_(False),
-        'child_genome': jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32),
-        'child_len': jnp.int32(0),
-        'color': jnp.zeros(3, dtype=jnp.float32), 
+        'counter': jnp.int32(0),
+        'gestation_time': jnp.int32(2147483647),
+        # Child tape for placement after divide
+        'child_tape': jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32),
+        'child_tape_len': jnp.int32(0),
+        # Visualization
+        'color': jnp.zeros(3, dtype=jnp.float32),
         'child_color': jnp.zeros(3, dtype=jnp.float32),
-        'instr_ops': jnp.full((cfg.max_instructions, cfg.max_ops_per_instr), NOP, dtype=jnp.int32),
-        'instr_args': jnp.zeros((cfg.max_instructions, cfg.max_ops_per_instr, 2), dtype=jnp.int32),
-        'instr_n_ops': jnp.zeros(cfg.max_instructions, dtype=jnp.int32),
     }
 
 
@@ -119,415 +209,797 @@ def create_organism_state(cfg: Config):
 # 4. GENOME PARSING
 # ==========================================
 
-def parse_genome(genome: jnp.ndarray, genome_len: jnp.int32, cfg: Config):
-    """Parse genome into phenotype using vectorized operations."""
-    
-    # Create position indices
+def build_structure(genome, genome_len, cfg):
+    """Scan genome before SEP. Count R/S/Q markers as structural elements.
+    SE[0] is always IP (implicit). R/S/Q each add one SE (simplification:
+    all treated as registers; stacks/queues not deeply supported).
+    Returns n_ses, separator_pos.
+    """
+    # Scan positions 0..genome_len-1 looking for R, S, Q, SEP
+    # Stop at first SEP
     positions = jnp.arange(cfg.max_genome_len)
-    valid_pos = positions < genome_len
-    
-    # A. Count registers: Rs at start before B, I, or SEP
-    is_R = (genome == R) & valid_pos
-    is_marker = ((genome == B) | (genome == I) | (genome == SEP)) & valid_pos
-    
-    # Find first marker position
-    marker_positions = jnp.where(is_marker, positions, cfg.max_genome_len)
-    first_marker = jnp.min(marker_positions)
-    
-    # Count Rs before first marker
-    n_regs = jnp.sum(is_R & (positions < first_marker))
-    n_regs = jnp.maximum(n_regs, 1)
-    
-    # Language section starts after first marker (skip B if present)
-    language_start = jnp.where(genome[first_marker] == B, first_marker + 1, first_marker)
-    language_start = jnp.minimum(language_start, genome_len)
-    
-    # B. Find SEP position (end of instruction definitions)
-    is_SEP = (genome == SEP) & valid_pos & (positions >= language_start)
-    sep_positions = jnp.where(is_SEP, positions, cfg.max_genome_len)
-    sep_pos = jnp.min(sep_positions)
-    
-    # C. Find instruction markers (I) between language_start and sep_pos
-    is_I = (genome == I) & valid_pos & (positions >= language_start) & (positions < sep_pos)
-    
-    # Get positions of I markers
-    I_positions = jnp.where(is_I, positions, cfg.max_genome_len)
-    I_positions = jnp.sort(I_positions)  # Valid positions first
-    
-    # D. Parse each instruction definition
-    # For simplicity, use a scan but only over max_instructions (small, e.g. 20)
-    instr_ops = jnp.full((cfg.max_instructions, cfg.max_ops_per_instr), NOP, dtype=jnp.int32)
-    instr_args = jnp.zeros((cfg.max_instructions, cfg.max_ops_per_instr, 2), dtype=jnp.int32)
-    instr_n_ops = jnp.zeros(cfg.max_instructions, dtype=jnp.int32)
-    
-    def parse_one_instruction(instr_idx):
-        """Parse instruction at I_positions[instr_idx]."""
-        start = I_positions[instr_idx]
-        valid_instr = start < cfg.max_genome_len
-        
-        # Find end of this instruction (next I or SEP)
-        next_markers = jnp.where(
-            ((genome == I) | (genome == SEP)) & (positions > start) & valid_pos,
-            positions,
-            cfg.max_genome_len
+    valid = positions < genome_len
+
+    def scan_fn(carry, pos):
+        n_ses, sep_pos, found_sep = carry
+        gene = jnp.where(valid[pos], genome[pos], BLANK)
+        is_sep = (gene == SEP) & ~found_sep
+        is_r = (gene == R) & ~found_sep
+        is_s = (gene == S) & ~found_sep
+        is_q = (gene == Q) & ~found_sep
+        is_se = is_r | is_s | is_q
+        n_ses = jnp.where(is_se & (n_ses < cfg.max_se_count), n_ses + 1, n_ses)
+        sep_pos = jnp.where(is_sep, pos, sep_pos)
+        found_sep = found_sep | is_sep
+        return (n_ses, sep_pos, found_sep), None
+
+    # Start with 1 SE (the implicit IP = SE[0])
+    (n_ses, separator_pos, _), _ = lax.scan(
+        scan_fn,
+        (jnp.int32(1), jnp.int32(0), jnp.bool_(False)),
+        jnp.arange(cfg.max_genome_len)
+    )
+
+    return n_ses, separator_pos
+
+
+def build_instruction_set(genome, genome_len, separator_pos, cfg):
+    """Build instruction table from genome, matching UP.java buildInstructionSet + createInstruction.
+
+    Scans genome[0..separator_pos-1] for I markers.
+    Each pair of consecutive I markers (or I→SEP) defines one instruction.
+    Content between markers is read, opcodes normalized via abs(val) % UP_IS_SIZE,
+    then operands skipped based on N_OPERANDS lookup.
+    """
+    positions = jnp.arange(cfg.max_genome_len)
+    valid = positions < separator_pos
+
+    # Find I marker positions
+    is_i_marker = (genome == I) & valid
+    # Collect I positions (sorted, padded with max_genome_len)
+    i_positions = jnp.where(is_i_marker, positions, cfg.max_genome_len)
+    i_positions = jnp.sort(i_positions)
+
+    # Count actual I markers
+    n_i_markers = jnp.sum(is_i_marker.astype(jnp.int32))
+
+    # For each instruction index, determine start (after I marker) and stop (next I or SEP)
+    def create_one_instruction(instr_idx):
+        """Create instruction number instr_idx."""
+        i_pos = i_positions[instr_idx]
+        valid_instr = instr_idx < n_i_markers
+
+        start = i_pos + 1  # Content starts after the I marker
+
+        # Find the end: next I marker or separator_pos
+        next_i_pos = jnp.where(
+            (instr_idx + 1) < n_i_markers,
+            i_positions[instr_idx + 1],
+            separator_pos
         )
-        end = jnp.min(next_markers)
-        
-        # Parse ops within this instruction
-        ops_row = jnp.full(cfg.max_ops_per_instr, NOP, dtype=jnp.int32)
-        args_row = jnp.zeros((cfg.max_ops_per_instr, 2), dtype=jnp.int32)
-        
-        def parse_op(carry, op_idx):
-            ptr, ops_row, args_row, n_ops = carry
-            
-            at_end = (ptr >= end) | (ptr >= genome_len)
-            gene = jnp.where(at_end, NOP, genome[ptr])
-            
-            is_2arg = (gene == MOVE) | (gene == LOAD) | (gene == STORE) | (gene == ADD) | (gene == SUB) | (gene == IFZERO)
-            is_1arg = (gene == READ_SIZE) | (gene == ALLOCATE) | (gene == INC) | (gene == DEC) | (gene == JUMP)
-            is_0arg = gene == DIVIDE
-            is_op = is_2arg | is_1arg | is_0arg
-            
-            valid_op = is_op & ~at_end & (op_idx < cfg.max_ops_per_instr)
-            
-            ops_row = jnp.where(valid_op, ops_row.at[op_idx].set(gene), ops_row)
-            
-            arg0 = jnp.where((ptr + 1 < genome_len) & (is_1arg | is_2arg), genome[ptr + 1], 0)
-            arg1 = jnp.where((ptr + 2 < genome_len) & is_2arg, genome[ptr + 2], 0)
-            args_row = jnp.where(valid_op, args_row.at[op_idx, 0].set(arg0), args_row)
-            args_row = jnp.where(valid_op, args_row.at[op_idx, 1].set(arg1), args_row)
-            
-            advance = jnp.where(is_2arg, 3, jnp.where(is_1arg, 2, jnp.where(is_0arg, 1, 1)))
-            ptr = jnp.where(valid_op, ptr + advance, jnp.where(~at_end, ptr + 1, ptr))
-            n_ops = jnp.where(valid_op, n_ops + 1, n_ops)
-            
-            return (ptr, ops_row, args_row, n_ops), None
-        
-        # Start parsing after the I marker
-        init_ptr = jnp.where(valid_instr, start + 1, cfg.max_genome_len)
-        (_, ops_row, args_row, n_ops), _ = lax.scan(
-            parse_op,
-            (init_ptr, ops_row, args_row, jnp.int32(0)),
-            jnp.arange(cfg.max_ops_per_instr)
+        stop = next_i_pos
+        size = stop - start
+
+        # Read raw content from genome[start:stop]
+        raw = jnp.full(cfg.max_micro_ops, BLANK, dtype=jnp.int32)
+        def read_raw(j):
+            pos = start + j
+            return jnp.where((j < size) & (pos < genome_len), genome[pos], BLANK)
+        raw = jax.vmap(read_raw)(jnp.arange(cfg.max_micro_ops))
+
+        # Normalize: walk through raw, normalize opcodes, skip operands
+        def normalize_step(carry, j):
+            out_arr, next_opcode_pos = carry
+            is_opcode_pos = (j == next_opcode_pos) & (j < size)
+            val = raw[j]
+            # Normalize opcode: abs(val) % UP_IS_SIZE
+            normalized = jnp.abs(val) % UP_IS_SIZE
+            # Look up operand count for this opcode
+            n_ops = N_OPERANDS[normalized]
+            # If this is an opcode position, normalize it; operand positions stay raw
+            out_val = jnp.where(is_opcode_pos, normalized, val)
+            out_arr = jnp.where(j < size, out_arr.at[j].set(out_val), out_arr)
+            # Next opcode position is current + 1 + n_ops
+            next_opcode_pos = jnp.where(is_opcode_pos, j + 1 + n_ops, next_opcode_pos)
+            return (out_arr, next_opcode_pos), None
+
+        init_arr = jnp.full(cfg.max_micro_ops, BLANK, dtype=jnp.int32)
+        (result_arr, _), _ = lax.scan(
+            normalize_step,
+            (init_arr, jnp.int32(0)),  # First opcode at position 0
+            jnp.arange(cfg.max_micro_ops)
         )
-        
-        return ops_row, args_row, n_ops, valid_instr
-    
-    # Parse all instructions (vmap over instruction indices)
-    all_ops, all_args, all_n_ops, all_valid = jax.vmap(parse_one_instruction)(
+
+        # Mask invalid instruction
+        result_arr = jnp.where(valid_instr, result_arr, jnp.full(cfg.max_micro_ops, BLANK, dtype=jnp.int32))
+        length = jnp.where(valid_instr, jnp.minimum(size, cfg.max_micro_ops), jnp.int32(0))
+
+        return result_arr, length
+
+    instruction_table, instruction_lengths = jax.vmap(create_one_instruction)(
         jnp.arange(cfg.max_instructions)
     )
-    
-    # Only keep valid instructions
-    instr_ops = jnp.where(all_valid[:, None], all_ops, instr_ops)
-    instr_args = jnp.where(all_valid[:, None, None], all_args, instr_args)
-    instr_n_ops = jnp.where(all_valid, all_n_ops, instr_n_ops)
-    
-    n_instructions = jnp.sum(all_valid.astype(jnp.int32))
-    n_instructions = jnp.maximum(n_instructions, 1)
-    
-    # Code section starts after SEP
-    code_start = jnp.where(sep_pos < genome_len, sep_pos + 1, genome_len)
-    
+
+    n_instructions = jnp.minimum(n_i_markers, cfg.max_instructions)
+
+    return instruction_table, instruction_lengths, n_instructions
+
+
+def parse_genome(genome, genome_len, cfg):
+    """Parse genome into phenotype: structure + instruction set."""
+    n_ses, separator_pos = build_structure(genome, genome_len, cfg)
+    instruction_table, instruction_lengths, n_instructions = build_instruction_set(
+        genome, genome_len, separator_pos, cfg
+    )
     return {
-        'n_regs': n_regs,
+        'n_ses': n_ses,
+        'separator_pos': separator_pos,
         'n_instructions': n_instructions,
-        'code_start': code_start,
-        'instr_ops': instr_ops,
-        'instr_args': instr_args,
-        'instr_n_ops': instr_n_ops,
+        'instruction_table': instruction_table,
+        'instruction_lengths': instruction_lengths,
     }
 
 
 # ==========================================
-# 5. VM EXECUTION (single step)
+# 5. VM EXECUTION
 # ==========================================
 
-def vm_step(state: dict, cfg: Config):
-    """Execute one VM step for an organism (Logical Instruction version)."""
+def tape_read(genome, genome_len, child, child_len, already_allocated, position):
+    """Unified address space read. Matches CellGeneticCodeTape.read().
+    position = abs(position % total_size)
+    [0, parent_len) -> parent, [parent_len, total) -> child
+    """
+    total_size = genome_len + jnp.where(already_allocated, child_len, 0)
+    total_size = jnp.maximum(total_size, 1)
+    pos = jnp.abs(position) % total_size
+    in_parent = pos < genome_len
+    parent_val = genome[jnp.clip(pos, 0, genome_len - 1)]
+    child_idx = jnp.clip(pos - genome_len, 0, child_len - 1)
+    child_val = child[child_idx]
+    return jnp.where(in_parent, parent_val, child_val)
+
+
+def tape_write(genome, child, child_copied, genome_len, child_len, already_allocated,
+               position, value, key, copy_mutation_rate):
+    """Unified address space write. Matches CellGeneticCodeTape.write().
+    Writes to parent or child. Copy mutation only on child writes.
+    Returns (genome, child, child_copied).
+    """
+    total_size = genome_len + jnp.where(already_allocated, child_len, 0)
+    total_size = jnp.maximum(total_size, 1)
+    pos = jnp.abs(position) % total_size
+    in_parent = pos < genome_len
+
+    # Parent write
+    parent_idx = jnp.clip(pos, 0, genome_len - 1)
+    genome = jnp.where(
+        in_parent,
+        genome.at[parent_idx].set(value),
+        genome
+    )
+
+    # Child write
+    child_idx = jnp.clip(pos - genome_len, 0, child_len - 1)
+    in_child = ~in_parent & already_allocated
+
+    # Copy mutation: replace with random gene
+    k1, k2 = random.split(key)
+    do_mutate = random.uniform(k1) < copy_mutation_rate
+    mutated_value = random.randint(k2, (), 0, UP_IS_SIZE).astype(jnp.int32)
+    final_value = jnp.where(do_mutate & in_child, mutated_value, value)
+
+    child = jnp.where(
+        in_child,
+        child.at[child_idx].set(final_value),
+        child
+    )
+    child_copied = jnp.where(
+        in_child,
+        child_copied.at[child_idx].set(True),
+        child_copied
+    )
+
+    return genome, child, child_copied
+
+
+def tape_fetch_inst(genome, genome_len, ip_val):
+    """Fetch instruction from parent memory only. Out-of-bounds returns BLANK.
+    Matches CellGeneticCodeTape.fetchInst().
+    """
+    in_bounds = (ip_val >= 0) & (ip_val < genome_len)
+    idx = jnp.clip(ip_val, 0, genome_len - 1)
+    return jnp.where(in_bounds, genome[idx], BLANK)
+
+
+def vm_execute_one(state, key, cfg):
+    """Execute one compound instruction. Matches UP.java execute().
+
+    1. fetchInst(IP) from parent memory
+    2. Map to instruction index: abs(fetched) % n_instructions
+    3. Execute micro-ops via lax.scan
+    4. IP += 1 unless divide returned
+    """
     genome = state['genome']
     genome_len = state['genome_len']
-    registers = state['registers']
-    ip = state['ip'] # Logical IP (0..n_instructions-1)
-    code_start = state['code_start']
-    n_regs = state['n_regs']
+    se_values = state['se_values']
+    n_ses = state['n_ses']
     n_instructions = state['n_instructions']
-    instr_ops = state['instr_ops']
-    instr_args = state['instr_args']
-    child_genome = state['child_genome']
+    instruction_table = state['instruction_table']
+    instruction_lengths = state['instruction_lengths']
+    child = state['child']
     child_len = state['child_len']
+    child_copied = state['child_copied']
+    already_allocated = state['already_allocated']
+    separator_pos = state['separator_pos']
     has_child = state['has_child']
-    
-    # Ensure IP is valid (wrap-around safety for logical index)
-    ip = jnp.where((ip < 0) | (ip >= n_instructions), 0, ip)
-    
-    # Next IP (default increment)
-    next_ip = (ip + 1) % jnp.maximum(n_instructions, 1)
-    
-    def exec_op(carry, op_idx):
-        registers, child_genome, child_len, has_child, ip_ctrl = carry
-        
-        op = instr_ops[ip, op_idx]
-        arg0 = instr_args[ip, op_idx, 0]
-        arg1 = instr_args[ip, op_idx, 1]
-        
-        valid_op = op != NOP
-        
-        def get_reg(idx):
-            return registers[idx % n_regs]
-        
-        def set_reg(idx, val):
-            return registers.at[idx % n_regs].set(val)
-        
-        # READ_SIZE
-        registers = jnp.where(
-            (op == READ_SIZE) & valid_op, 
-            set_reg(arg0, genome_len), 
-            registers
+    counter = state['counter']
+    gestation_time = state['gestation_time']
+
+    ip_val = se_values[0]  # SE[0] = IP
+
+    # 1. Fetch instruction from parent tape
+    fetched = tape_fetch_inst(genome, genome_len, ip_val)
+
+    # 2. Map to instruction index
+    safe_n_instr = jnp.maximum(n_instructions, 1)
+    instr_idx = jnp.abs(fetched) % safe_n_instr
+    instr_idx = jnp.where(n_instructions > 0, instr_idx, 0)
+    instr = instruction_table[instr_idx]
+    instr_len = instruction_lengths[instr_idx]
+
+    # 3. Execute micro-ops
+    # The fillOperands logic: read operands from instruction array;
+    # if not enough, read from tape and advance IP.
+
+    # We need to track: position in instruction array, IP (for overflow reads),
+    # SE values, child state, divide_returned flag, and a "next_opcode_pos"
+    # to know which positions are opcodes vs operands.
+
+    # Pre-split keys for all micro-op steps
+    step_keys = random.split(key, cfg.max_micro_ops + 1)
+
+    def micro_op_step(carry, step_idx):
+        (se_vals, child_arr, child_cop, genome_arr, already_alloc, child_l,
+         ip_for_overflow, pos_in_instr, next_opcode_pos, divide_returned,
+         cntr, gest_time, has_ch) = carry
+
+        step_key = step_keys[step_idx]
+
+        # Are we at a valid position?
+        at_valid = (pos_in_instr < instr_len) & ~divide_returned
+
+        # Read current value from instruction
+        safe_pos = jnp.clip(pos_in_instr, 0, cfg.max_micro_ops - 1)
+        cur_val = instr[safe_pos]
+
+        # Is this position an opcode?
+        is_opcode = (pos_in_instr == next_opcode_pos) & at_valid
+
+        # Get opcode (already normalized during parsing)
+        opcode = jnp.where(is_opcode, cur_val, NOP)
+
+        # Get number of operands for this opcode
+        safe_opcode = jnp.clip(opcode, 0, UP_IS_SIZE - 1)
+        n_ops = jnp.where(is_opcode, N_OPERANDS[safe_opcode], jnp.int32(0))
+
+        # fillOperands: read n_ops operands starting from pos_in_instr+1
+        # If not enough in instruction, fetch from tape (parent) and advance ip
+        ops_start = pos_in_instr + 1
+        remaining_in_instr = jnp.maximum(instr_len - ops_start, 0)
+
+        # Read up to 3 operands
+        def read_operand(op_idx, ip_ov):
+            """Read one operand. From instruction if available, else from tape."""
+            instr_pos = ops_start + op_idx
+            from_instr = op_idx < remaining_in_instr
+            safe_ipos = jnp.clip(instr_pos, 0, cfg.max_micro_ops - 1)
+            instr_val = instr[safe_ipos]
+            tape_val = tape_read(genome_arr, genome_len, child_arr, child_l, already_alloc, ip_ov)
+            val = jnp.where(from_instr, instr_val, tape_val)
+            # Advance IP only when reading from tape
+            new_ip = jnp.where(from_instr, ip_ov, ip_ov + 1)
+            return val, new_ip
+
+        op0, ip_ov1 = read_operand(jnp.int32(0), ip_for_overflow)
+        op1, ip_ov2 = read_operand(jnp.int32(1), ip_ov1)
+        op2, ip_ov3 = read_operand(jnp.int32(2), ip_ov2)
+
+        # Select appropriate IP based on actual n_ops
+        ip_after_ops = jnp.where(n_ops >= 3, ip_ov3, jnp.where(n_ops >= 2, ip_ov2, jnp.where(n_ops >= 1, ip_ov1, ip_for_overflow)))
+
+        # Normalize operands: abs(val) % Short.MAX_VALUE, then % n_ses for SE indexing
+        def norm_op(val):
+            v = jnp.where(val < 0, -val, val) % 32767
+            return v % jnp.maximum(n_ses, 1)
+
+        o0 = norm_op(op0)
+        o1 = norm_op(op1)
+        o2 = norm_op(op2)
+
+        # Helper to read/write SEs
+        def se_read(idx):
+            return se_vals[jnp.clip(idx, 0, cfg.max_se_count - 1)]
+
+        def se_write(se_arr, idx, val):
+            return se_arr.at[jnp.clip(idx, 0, cfg.max_se_count - 1)].set(val)
+
+        # Compute tape_size for CINC/CDEC
+        tape_size = genome_len + jnp.where(already_alloc, child_l, 0)
+        tape_size = jnp.maximum(tape_size, 1)
+
+        # ---- Execute opcode ----
+        # Default: no change
+        new_se = se_vals
+        new_child = child_arr
+        new_child_cop = child_cop
+        new_genome = genome_arr
+        new_already_alloc = already_alloc
+        new_child_l = child_l
+        new_ip_ov = ip_after_ops
+        new_divide_ret = divide_returned
+        new_cntr = cntr
+        new_gest = gest_time
+        new_has_ch = has_ch
+        did_jump = jnp.bool_(False)
+
+        # NOP (0): do nothing — also handles descriptors R/S/Q/I/B/SEP which fall to default
+        # IN (1): NOP stub (consume 1 operand, do nothing)
+        # OUT (2): NOP stub
+        # SDIR (13), GDIR (14), SEND (15), RECEIVE (16): NOP stubs
+        # FORK_TH (29), KILL_TH (30): NOP stubs
+
+        # LOAD (3): SE[o1] = tape.read(SE[o0])
+        is_load = is_opcode & (opcode == LOAD)
+        load_addr = se_read(o0)
+        load_val = tape_read(new_genome, genome_len, new_child, new_child_l, new_already_alloc, load_addr)
+        new_se = jnp.where(is_load, se_write(new_se, o1, load_val), new_se)
+
+        # STORE (4): tape.write(SE[o0], SE[o1]) — destination is o0, data is o1
+        is_store = is_opcode & (opcode == STORE)
+        store_dest = se_read(o0)
+        store_data = se_read(o1)
+        k_store = step_key
+        g_s, c_s, cc_s = tape_write(
+            new_genome, new_child, new_child_cop, genome_len, new_child_l, new_already_alloc,
+            store_dest, store_data, k_store, cfg.copy_mutation_rate
         )
-        
-        # ALLOCATE
-        is_allocate = (op == ALLOCATE)
-        alloc_size = get_reg(arg0)
-        valid_alloc = (alloc_size > 0) & (alloc_size < cfg.max_genome_len)
-        child_len = jnp.where(is_allocate & valid_op & valid_alloc, alloc_size, child_len)
-        child_genome = jnp.where(
-            is_allocate & valid_op & valid_alloc,
-            jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32),
-            child_genome
+        new_genome = jnp.where(is_store, g_s, new_genome)
+        new_child = jnp.where(is_store, c_s, new_child)
+        new_child_cop = jnp.where(is_store, cc_s, new_child_cop)
+
+        # MOVE (5): SE[o1] = SE[o0]
+        is_move = is_opcode & (opcode == MOVE)
+        new_se = jnp.where(is_move, se_write(new_se, o1, se_read(o0)), new_se)
+
+        # ALLOCATE (6): allocate child if conditions met
+        is_allocate = is_opcode & (opcode == ALLOCATE)
+        alloc_size = se_read(o0)
+        alloc_possible = (
+            ~new_already_alloc &
+            (alloc_size > (cfg.min_allocation_ratio * genome_len).astype(jnp.int32)) &
+            (alloc_size < (cfg.max_allocation_ratio * genome_len).astype(jnp.int32))
         )
-        
-        # LOAD
-        is_load = op == LOAD
-        load_addr = get_reg(arg0)
-        load_val = jnp.where((load_addr >= 0) & (load_addr < genome_len), genome[load_addr], 0)
-        registers = jnp.where(is_load & valid_op, set_reg(arg1, load_val), registers)
-        
-        # STORE
-        is_store = op == STORE
-        store_addr = get_reg(arg1)
-        store_val = get_reg(arg0)
-        valid_store = (child_len > 0) & (store_addr >= 0) & (store_addr < child_len)
-        child_genome = jnp.where(
-            is_store & valid_op & valid_store,
-            child_genome.at[store_addr].set(store_val),
-            child_genome
+        do_alloc = is_allocate & alloc_possible
+        new_already_alloc = jnp.where(do_alloc, True, new_already_alloc)
+        new_child_l = jnp.where(do_alloc, alloc_size, new_child_l)
+        # Fill child with BLANK
+        blank_child = jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32)
+        new_child = jnp.where(do_alloc, blank_child, new_child)
+        new_child_cop = jnp.where(do_alloc, jnp.zeros(cfg.max_genome_len, dtype=jnp.bool_), new_child_cop)
+
+        # COMPARE (7): SE[o2] = sign(SE[o0] - SE[o1])
+        is_compare = is_opcode & (opcode == COMPARE)
+        cmp_a = se_read(o0)
+        cmp_b = se_read(o1)
+        cmp_result = jnp.where(cmp_a < cmp_b, -1, jnp.where(cmp_a == cmp_b, 0, 1))
+        new_se = jnp.where(is_compare, se_write(new_se, o2, cmp_result), new_se)
+
+        # IFZERO (8): if SE[o0] != 0, skip next instruction (IP += 1)
+        is_ifzero = is_opcode & (opcode == IFZERO)
+        ifz_val = se_read(o0)
+        ifz_skip = ifz_val != 0
+        # IP increment happens via incrementing se_values[0]
+        new_se = jnp.where(
+            is_ifzero & ifz_skip,
+            se_write(new_se, jnp.int32(0), new_se[0] + 1),
+            new_se
         )
-        
-        # MOVE
-        registers = jnp.where((op == MOVE) & valid_op, set_reg(arg1, get_reg(arg0)), registers)
-        # INC
-        registers = jnp.where((op == INC) & valid_op, set_reg(arg0, get_reg(arg0) + 1), registers)
-        # DEC
-        registers = jnp.where((op == DEC) & valid_op, set_reg(arg0, get_reg(arg0) - 1), registers)
-        # ADD
-        registers = jnp.where((op == ADD) & valid_op, set_reg(arg0, get_reg(arg0) + get_reg(arg1)), registers)
-        # SUB
-        registers = jnp.where((op == SUB) & valid_op, set_reg(arg0, get_reg(arg0) - get_reg(arg1)), registers)
-        
-        # IFZERO
-        is_ifzero = op == IFZERO
-        skip = get_reg(arg0) == 0
-        # Add relative offset to IP
-        ip_ctrl = jnp.where(is_ifzero & valid_op & skip, (ip_ctrl + arg1) % jnp.maximum(n_instructions, 1), ip_ctrl)
-        
-        # JUMP
-        is_jump = op == JUMP
-        jump_target = arg0 % jnp.maximum(n_instructions, 1)
-        ip_ctrl = jnp.where(is_jump & valid_op, jump_target, ip_ctrl)
-        
-        # DIVIDE
-        is_divide = op == DIVIDE
-        valid_divide = child_len > 0
-        should_divide = is_divide & valid_op & valid_divide
-        
-        has_child = jnp.where(should_divide, True, has_child)
-        # Reset IP to 0 on birth
-        ip_ctrl = jnp.where(should_divide, 0, ip_ctrl)
-        
-        return (registers, child_genome, child_len, has_child, ip_ctrl), None
-    
-    (registers, child_genome, child_len, has_child, next_ip), _ = lax.scan(
-        exec_op,
-        (registers, child_genome, child_len, has_child, next_ip),
-        jnp.arange(cfg.max_ops_per_instr)
-    )
-    
+
+        # JUMP (9): IP = SE[o0]
+        is_jump = is_opcode & (opcode == JUMP)
+        jump_target = se_read(o0)
+        new_se = jnp.where(is_jump, se_write(new_se, jnp.int32(0), jump_target), new_se)
+        did_jump = did_jump | is_jump
+
+        # DEC (10): SE[o0] -= 1
+        is_dec = is_opcode & (opcode == DEC)
+        new_se = jnp.where(is_dec, se_write(new_se, o0, se_read(o0) - 1), new_se)
+
+        # INC (11): SE[o0] += 1
+        is_inc = is_opcode & (opcode == INC)
+        new_se = jnp.where(is_inc, se_write(new_se, o0, se_read(o0) + 1), new_se)
+
+        # DIVIDE (12): check allocation + proliferation, produce child
+        is_divide = is_opcode & (opcode == DIVIDE)
+        n_copied = jnp.sum(new_child_cop.astype(jnp.int32))
+        prolif_possible = (
+            new_already_alloc &
+            (n_copied > (cfg.min_proliferation_ratio * genome_len).astype(jnp.int32))
+        )
+        do_divide = is_divide & prolif_possible
+
+        # On successful divide: record gestation, set has_child
+        new_gest = jnp.where(do_divide, new_cntr, new_gest)
+        new_has_ch = jnp.where(do_divide, True, new_has_ch)
+        new_divide_ret = jnp.where(is_divide, True, new_divide_ret)
+
+        # On failed divide: IP += 1
+        failed_divide = is_divide & ~prolif_possible
+        new_se = jnp.where(
+            failed_divide,
+            se_write(new_se, jnp.int32(0), new_se[0] + 1),
+            new_se
+        )
+
+        # ADD (17): SE[o2] = SE[o0] + SE[o1]
+        is_add = is_opcode & (opcode == ADD)
+        new_se = jnp.where(is_add, se_write(new_se, o2, se_read(o0) + se_read(o1)), new_se)
+
+        # SUB (18): SE[o2] = SE[o0] - SE[o1]
+        is_sub = is_opcode & (opcode == SUB)
+        new_se = jnp.where(is_sub, se_write(new_se, o2, se_read(o0) - se_read(o1)), new_se)
+
+        # MUL (19): SE[o2] = SE[o0] * SE[o1]
+        is_mul = is_opcode & (opcode == MUL)
+        new_se = jnp.where(is_mul, se_write(new_se, o2, se_read(o0) * se_read(o1)), new_se)
+
+        # DIV (20): SE[o2] = SE[o0] / SE[o1] (integer, skip if divisor=0)
+        is_div = is_opcode & (opcode == DIV_OP)
+        divisor = se_read(o1)
+        safe_divisor = jnp.where(divisor == 0, 1, divisor)
+        div_result = se_read(o0) // safe_divisor
+        new_se = jnp.where(is_div & (divisor != 0), se_write(new_se, o2, div_result), new_se)
+
+        # MOD (21): SE[o2] = SE[o0] % SE[o1] (skip if divisor=0)
+        is_mod = is_opcode & (opcode == MOD)
+        mod_divisor = se_read(o1)
+        safe_mod_div = jnp.where(mod_divisor == 0, 1, mod_divisor)
+        mod_result = se_read(o0) % safe_mod_div
+        new_se = jnp.where(is_mod & (mod_divisor != 0), se_write(new_se, o2, mod_result), new_se)
+
+        # AND (22): SE[o2] = SE[o0] & SE[o1]
+        is_and = is_opcode & (opcode == AND)
+        new_se = jnp.where(is_and, se_write(new_se, o2, se_read(o0) & se_read(o1)), new_se)
+
+        # OR (23): SE[o2] = SE[o0] | SE[o1]
+        is_or = is_opcode & (opcode == OR)
+        new_se = jnp.where(is_or, se_write(new_se, o2, se_read(o0) | se_read(o1)), new_se)
+
+        # XOR (24): SE[o2] = SE[o0] ^ SE[o1]
+        is_xor = is_opcode & (opcode == XOR)
+        new_se = jnp.where(is_xor, se_write(new_se, o2, se_read(o0) ^ se_read(o1)), new_se)
+
+        # NEG (25): SE[o1] = -SE[o0]
+        is_neg = is_opcode & (opcode == NEG)
+        new_se = jnp.where(is_neg, se_write(new_se, o1, -se_read(o0)), new_se)
+
+        # NOT (26): SE[o1] = ~SE[o0]
+        is_not = is_opcode & (opcode == NOT)
+        new_se = jnp.where(is_not, se_write(new_se, o1, ~se_read(o0)), new_se)
+
+        # SHIFT_L (27): SE[o1] = SE[o0] << 1
+        is_shl = is_opcode & (opcode == SHIFT_L)
+        new_se = jnp.where(is_shl, se_write(new_se, o1, se_read(o0) << 1), new_se)
+
+        # SHIFT_R (28): SE[o1] = SE[o0] >> 1
+        is_shr = is_opcode & (opcode == SHIFT_R)
+        new_se = jnp.where(is_shr, se_write(new_se, o1, se_read(o0) >> 1), new_se)
+
+        # CLEAR (37): SE[o0] = 0
+        is_clear = is_opcode & (opcode == CLEAR)
+        new_se = jnp.where(is_clear, se_write(new_se, o0, 0), new_se)
+
+        # CINC (38): SE[o0] = (SE[o0] + 1) % tape_size
+        is_cinc = is_opcode & (opcode == CINC)
+        cinc_val = (se_read(o0) + 1) % tape_size
+        new_se = jnp.where(is_cinc, se_write(new_se, o0, cinc_val), new_se)
+
+        # CDEC (39): SE[o0] -= 1, wrap to tape_size-1 if negative
+        is_cdec = is_opcode & (opcode == CDEC)
+        cdec_raw = se_read(o0) - 1
+        cdec_val = jnp.where(cdec_raw < 0, tape_size - 1, cdec_raw)
+        new_se = jnp.where(is_cdec, se_write(new_se, o0, cdec_val), new_se)
+
+        # IS_SEP (40): SE[o1] = 1 if tape.read(SE[o0]) == SEP else 0
+        # Wait — re-reading UP.java: is_sep(src, dst) reads SE[src], not tape.read(SE[src])
+        # Actually: ses[src % ssize].read() == SEPARATOR → it reads the SE value, not from tape
+        is_issep = is_opcode & (opcode == IS_SEP)
+        issep_val = jnp.where(se_read(o0) == SEP, jnp.int32(1), jnp.int32(0))
+        new_se = jnp.where(is_issep, se_write(new_se, o1, issep_val), new_se)
+
+        # REL_LOAD (41): SE[o2] = tape.read(SE[o0] + SE[o1])
+        is_rload = is_opcode & (opcode == REL_LOAD)
+        rload_addr = se_read(o0) + se_read(o1)
+        rload_val = tape_read(new_genome, genome_len, new_child, new_child_l, new_already_alloc, rload_addr)
+        new_se = jnp.where(is_rload, se_write(new_se, o2, rload_val), new_se)
+
+        # REL_STORE (42): tape.write(SE[o0] + SE[o1], SE[o2])
+        is_rstore = is_opcode & (opcode == REL_STORE)
+        rstore_addr = se_read(o0) + se_read(o1)
+        rstore_data = se_read(o2)
+        k_rstore = step_key
+        g_rs, c_rs, cc_rs = tape_write(
+            new_genome, new_child, new_child_cop, genome_len, new_child_l, new_already_alloc,
+            rstore_addr, rstore_data, k_rstore, cfg.copy_mutation_rate
+        )
+        new_genome = jnp.where(is_rstore, g_rs, new_genome)
+        new_child = jnp.where(is_rstore, c_rs, new_child)
+        new_child_cop = jnp.where(is_rstore, cc_rs, new_child_cop)
+
+        # IFNOTZERO (43): if SE[o0] == 0, skip next instruction (IP += 1)
+        is_ifnz = is_opcode & (opcode == IFNOTZERO)
+        ifnz_val = se_read(o0)
+        ifnz_skip = ifnz_val == 0
+        new_se = jnp.where(
+            is_ifnz & ifnz_skip,
+            se_write(new_se, jnp.int32(0), new_se[0] + 1),
+            new_se
+        )
+
+        # Update counter (counts micro-ops, matching UP.java counter++ per micro-op in while loop)
+        new_cntr = jnp.where(is_opcode, new_cntr + 1, new_cntr)
+
+        # Advance position: if this was an opcode, next position = pos + 1 + n_ops
+        # (operands are already consumed). If not opcode, shouldn't happen (we skip).
+        ops_consumed_from_instr = jnp.minimum(n_ops, remaining_in_instr)
+        new_pos = jnp.where(
+            is_opcode,
+            pos_in_instr + 1 + ops_consumed_from_instr,
+            pos_in_instr  # Stay put if not at a valid opcode position
+        )
+
+        # Update next_opcode_pos
+        new_next_opcode = jnp.where(is_opcode, new_pos, next_opcode_pos)
+
+        # Update IP for overflow
+        new_ip_ov = jnp.where(is_opcode, ip_after_ops, ip_for_overflow)
+        # For JUMP: the outer loop will add 1, so we set IP = target and did_jump
+        # (But IP overflow tracking is separate from SE[0]; SE[0] is the real IP)
+
+        new_carry = (new_se, new_child, new_child_cop, new_genome, new_already_alloc, new_child_l,
+                     new_ip_ov, new_pos, new_next_opcode, new_divide_ret,
+                     new_cntr, new_gest, new_has_ch)
+        return new_carry, did_jump
+
+    init_carry = (se_values, child, child_copied, genome, already_allocated, child_len,
+                  ip_val, jnp.int32(0), jnp.int32(0), jnp.bool_(False),
+                  counter, gestation_time, has_child)
+
+    final_carry, did_jumps = lax.scan(micro_op_step, init_carry, jnp.arange(cfg.max_micro_ops))
+
+    (se_values, child, child_copied, genome, already_allocated, child_len,
+     ip_for_overflow, _, _, divide_returned,
+     counter, gestation_time, has_child) = final_carry
+
+    any_jump = jnp.any(did_jumps)
+
+    # Post micro-ops: IP += 1 unless divide returned
+    # In UP.java: after the while loop, incrementIP(1) is called.
+    # But JUMP sets IP directly (and the +1 still applies after).
+    # And DIVIDE returns early (no +1).
+    # IFZERO/IFNOTZERO already added their +1 to IP inside the loop.
+    # So: IP += 1 unconditionally, unless divide_returned.
+    # But if JUMP happened, IP was already set to target in the loop.
+    # The +1 still applies! In UP.java, jump() calls setIP(), then execute() does incrementIP(1).
+    # Wait — actually DIVIDE calls return before incrementIP. Let me re-read.
+    # In UP.java execute(): the DIVIDE case does return (exits execute method),
+    # so incrementIP(1) at the bottom is NOT reached for DIVIDE.
+    # For JUMP: setIP(target), then incrementIP(1) is called. So effective IP = target + 1? No!
+    # Actually wait — looking at UP.java more carefully:
+    # jump() calls setIP(ses[address % ssize].read()) which directly sets IP.value
+    # Then after the while loop, incrementIP(1) adds 1 to IP.
+    # So yes, IP ends up at target + 1 after a jump. But wait... that seems wrong for the ancestor.
+    # Let me check: instruction 6 is "jump 3" which means jump to SE[3].
+    # But the ancestor's usage: SE[3] is the "return_reg" which stores the IP value.
+    # The ancestor's instruction 2 does "move 0 3" which copies IP (SE[0]) to SE[3].
+    # Then later instruction 6 does "jump 3" meaning IP = SE[3]. Then +1 is applied.
+    # So if SE[3] stored the IP of instruction 2's execution, the jump goes to SE[3]+1.
+    # Actually, in UP.java, IP is set via setIP then incrementIP(1) after the while loop.
+    # BUT: the jump instruction inside the while loop sets IP. The while loop continues
+    # executing remaining micro-ops in the compound instruction. Then incrementIP(1).
+    # So effective: IP_final = (whatever IP was after all micro-ops in the instruction) + 1
+    # For jump specifically: IP = SE[addr], then after loop: IP += 1
+    #
+    # OK but there's a subtlety: does the while loop continue after jump?
+    # Yes! There's no break/return for JUMP — it just sets IP and continues to next micro-op.
+    # Only DIVIDE does return.
+    #
+    # So the +1 applies to whatever IP is at the end of the compound instruction.
+
+    new_ip = se_values[0] + 1
+    new_ip = jnp.where(divide_returned, se_values[0], new_ip)
+
+    # On successful divide: restart (IP = separator_pos + 1, counter = 0)
+    do_divide_success = has_child & ~state['has_child']  # Newly set
+    restart_ip = (separator_pos + 1) % jnp.maximum(genome_len, 1)
+    new_ip = jnp.where(do_divide_success, restart_ip, new_ip)
+    counter = jnp.where(do_divide_success, jnp.int32(0), counter)
+
+    se_values = se_values.at[0].set(new_ip)
+
     new_state = state.copy()
-    new_state['registers'] = registers
-    new_state['ip'] = next_ip
-    new_state['child_genome'] = child_genome
+    new_state['se_values'] = se_values
+    new_state['child'] = child
     new_state['child_len'] = child_len
+    new_state['child_copied'] = child_copied
+    new_state['already_allocated'] = already_allocated
+    new_state['genome'] = genome
     new_state['has_child'] = has_child
-    
+    new_state['counter'] = counter
+    new_state['gestation_time'] = gestation_time
     return new_state
+
+
+def organism_update(state, key, cfg):
+    """Execute steps_per_update compound instructions on one organism."""
+    def step_fn(state, step_key):
+        should_exec = state['alive'] & ~state['has_child']
+        new_state = vm_execute_one(state, step_key, cfg)
+        # Only apply if should execute
+        result = jax.tree.map(
+            lambda n, o: jnp.where(should_exec, n, o),
+            new_state, state
+        )
+        return result, None
+
+    keys = random.split(key, cfg.steps_per_update)
+    state, _ = lax.scan(step_fn, state, keys)
+    return state
 
 
 # ==========================================
 # 6. MUTATION
 # ==========================================
 
-def mutate_genome(key: jax.Array, genome: jnp.ndarray, genome_len: jnp.int32, color: jnp.ndarray, cfg: Config):
-    """Apply mutations to a genome."""
-    k1, k2, k3, k4, k5, k6 = random.split(key, 6)
-    
-    # Point mutation
-    do_point = random.uniform(k1) < cfg.point_mutation_rate
-    point_idx = random.randint(k2, (), 0, jnp.maximum(genome_len, 1))
-    point_val = random.randint(k3, (), 0, 128) # Updated range
-    genome = jnp.where(
-        do_point & (point_idx < genome_len),
-        genome.at[point_idx].set(point_val),
-        genome
-    )
-    
-    # Indel mutation
-    do_indel = random.uniform(k4) < cfg.indel_rate
-    do_insert = random.uniform(k5) < 0.5
-    indel_idx = random.randint(k2, (), 0, jnp.maximum(genome_len, 1))
-    insert_val = random.randint(k3, (), 0, 128) # Updated range
-    
-    def do_insertion(args):
-        genome, genome_len = args
-        indices = jnp.arange(cfg.max_genome_len)
-        shifted = jnp.where(indices > indel_idx, genome[indices - 1], genome[indices])
-        shifted = shifted.at[indel_idx].set(insert_val)
-        new_len = jnp.minimum(genome_len + 1, cfg.max_genome_len)
-        return shifted, new_len
-    
-    def do_deletion(args):
-        genome, genome_len = args
-        indices = jnp.arange(cfg.max_genome_len)
-        shifted = jnp.where(
-            indices >= indel_idx, 
-            jnp.where(indices < cfg.max_genome_len - 1, genome[indices + 1], EMPTY),
-            genome[indices]
-        )
-        new_len = jnp.maximum(genome_len - 1, 5)
-        return shifted, new_len
-    
-    genome, genome_len = lax.cond(
-        do_indel,
-        lambda args: lax.cond(
-            do_insert & (args[1] < cfg.max_genome_len - 1), 
-            do_insertion, 
-            lambda a: lax.cond(args[1] > 5, do_deletion, lambda x: x, a),
-            args
-        ),
-        lambda args: args,
-        (genome, genome_len)
+def apply_divide_mutations(key, child_tape, child_tape_len, cfg):
+    """Apply divide mutations to child tape after successful divide.
+    Order: point mutation, insertion, deletion (matching CellGeneticCodeTape.divide()).
+    """
+    k1, k2, k3, k4, k5, k6, k7, k8 = random.split(key, 8)
+
+    # Point mutation (rate = divide_mutation_rate, typically 0.0)
+    do_point = random.uniform(k1) < cfg.divide_mutation_rate
+    point_pos = random.randint(k2, (), 0, jnp.maximum(child_tape_len, 1))
+    point_val = random.randint(k3, (), 0, UP_IS_SIZE).astype(jnp.int32)
+    child_tape = jnp.where(
+        do_point & (point_pos < child_tape_len),
+        child_tape.at[point_pos].set(point_val),
+        child_tape
     )
 
-    # Color mutation (HSV)
-    # If any mutation happened, shift color slightly
-    mutated = do_point | do_indel
-    
-    # Noise for Hue, Sat, Val separated
-    # Hue: wider drift, wrap around
-    noise_h = random.uniform(k6, (1,), minval=-0.05, maxval=0.05)
-    noise_sv = random.uniform(k6, (2,), minval=-0.02, maxval=0.02)
+    # Insertion (rate = divide_insert_rate)
+    do_insert = random.uniform(k4) < cfg.divide_insert_rate
+    insert_pos = random.randint(k5, (), 0, jnp.maximum(child_tape_len + 1, 1))
+    insert_val = random.randint(k3, (), 0, UP_IS_SIZE).astype(jnp.int32)
+    can_insert = do_insert & (child_tape_len < cfg.max_genome_len - 1)
+    # Shift right from insert_pos
+    indices = jnp.arange(cfg.max_genome_len)
+    shifted_right = jnp.where(
+        indices > insert_pos,
+        jnp.where(indices - 1 < cfg.max_genome_len, child_tape[jnp.clip(indices - 1, 0, cfg.max_genome_len - 1)], BLANK),
+        child_tape[indices]
+    )
+    shifted_right = shifted_right.at[insert_pos].set(insert_val)
+    child_tape = jnp.where(can_insert, shifted_right, child_tape)
+    child_tape_len = jnp.where(can_insert, child_tape_len + 1, child_tape_len)
+
+    # Deletion (rate = divide_delete_rate)
+    do_delete = random.uniform(k6) < cfg.divide_delete_rate
+    can_delete = do_delete & (child_tape_len > 1)
+    delete_pos = random.randint(k7, (), 0, jnp.maximum(child_tape_len - 1, 1))
+    # Shift left from delete_pos
+    shifted_left = jnp.where(
+        indices >= delete_pos,
+        jnp.where(indices + 1 < cfg.max_genome_len, child_tape[jnp.clip(indices + 1, 0, cfg.max_genome_len - 1)], BLANK),
+        child_tape[indices]
+    )
+    child_tape = jnp.where(can_delete, shifted_left, child_tape)
+    child_tape_len = jnp.where(can_delete, child_tape_len - 1, child_tape_len)
+
+    return child_tape, child_tape_len
+
+
+def mutate_color(key, color):
+    """Apply small HSV drift to color for lineage tracking."""
+    k1, k2 = random.split(key)
+    noise_h = random.uniform(k1, (1,), minval=-0.05, maxval=0.05)
+    noise_sv = random.uniform(k2, (2,), minval=-0.02, maxval=0.02)
     noise = jnp.concatenate([noise_h, noise_sv])
-    
-    # Only apply noise if mutated
-    delta = jnp.where(mutated, noise, 0.0)
-    
-    h = (color[0] + delta[0]) % 1.0 # Wrap hue
-    s = jnp.clip(color[1] + delta[1], 0.0, 1.0)
-    v = jnp.clip(color[2] + delta[2], 0.0, 1.0)
-    
-    new_color = jnp.array([h, s, v])
-    
-    return genome, genome_len, new_color
+    h = (color[0] + noise[0]) % 1.0
+    s = jnp.clip(color[1] + noise[1], 0.0, 1.0)
+    v = jnp.clip(color[2] + noise[2], 0.0, 1.0)
+    return jnp.array([h, s, v])
 
 
 # ==========================================
 # 7. POPULATION INITIALIZATION
 # ==========================================
 
-def create_ancestor_genome(cfg: Config):
-    """Create the ancestor genome."""
-    g = []
-    # Hardware: 4 registers
-    g += [R, R, R, R, B]
-    
-    # Instructions
-    g += [I, READ_SIZE, 1]                           # I0: R1 = size
-    g += [I, ALLOCATE, 1]                            # I1: allocate R1 bytes
-    g += [I, SUB, 2, 2]                              # I2: R2 = 0 (loop counter)
-    
-    # Inefficient Loop Body (Split into 3 instructions)
-    g += [I, LOAD, 2, 0]                             # I3: R0 = genome[R2]
-    g += [I, STORE, 0, 2]                            # I4: child[R2] = R0
-    g += [I, INC, 2]                                 # I5: R2++
-    
-    g += [I, MOVE, 1, 3, SUB, 3, 2]                  # I6: R3 = R1 - R2
-    g += [I, IFZERO, 3, 1]                           # I7: skip next (JUMP) if done
-    g += [I, JUMP, 3]                                # I8: loop back to I3
-    g += [I, DIVIDE]                                 # I9: birth
-    g += [SEP]
-    
-    # Code
-    g += [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    
-    genome = jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32)
-    genome = genome.at[:len(g)].set(jnp.array(g, dtype=jnp.int32))
+def create_ancestor_genome(cfg):
+    """Create the 78-gene arche.replicator ancestor genome."""
+    # Hardcoded from physis/data/genebank/arche/arche.replicator
+    g = jnp.array([
+        R, B, R, B, R, B, R,                           # Structure: 4 registers (+ IP = 5 SEs)
+        I, MOVE, NOP, 2,                                # I0: move 0 2 (store_ptr)
+        I, CLEAR, 1,                                    # I1: clear 1 (clear_counter)
+        I, MOVE, NOP, 3,                                # I2: move 0 3 (s_lab: store IP to return_reg)
+        I, INC, 1,                                      # I3: inc 1 (inc_counter)
+        I, CINC, 2,                                     # I4: cinc 2 (cinc_pointer)
+        I, LOAD, 2, 4, IS_SEP, 4, 4, IFZERO, 4,        # I5: load 2 4; is_sep 4 4; ifzero 4
+        I, JUMP, 3,                                     # I6: jump 3 (jump_by_reg)
+        I, ALLOCATE, 1,                                 # I7: allocate 1
+        I, MOVE, 1, 2,                                  # I8: move 1 2 (fill_pointer)
+        I, LOAD, 1, 4,                                  # I9: load 1 4 (load_data)
+        I, REL_STORE, 1, 2, 4,                          # I10: rel_store 1 2 4
+        I, DEC, 1,                                      # I11: dec 1
+        I, IFNOTZERO, 1,                                # I12: ifnotzero 1
+        I, DIVIDE,                                      # I13: divide
+        SEP,                                            # Separator at position 60
+        # Code section (positions 61-77): 17 entries mapping to 14 instructions
+        0, 1, 2, 3, 4, 5, 6, 3, 7, 8, 2, 11, 9, 10, 12, 6, 13
+    ], dtype=jnp.int32)
+
+    genome = jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32)
+    genome = genome.at[:len(g)].set(g)
     genome_len = jnp.int32(len(g))
-    
+
     return genome, genome_len
 
 
-def init_organism(genome: jnp.ndarray, genome_len: jnp.int32, color: jnp.ndarray, cfg: Config):
+def init_organism(genome, genome_len, color, cfg):
     """Initialize an organism from a genome."""
     state = create_organism_state(cfg)
     state['genome'] = genome
     state['genome_len'] = genome_len
     state['color'] = color
-    
+
     parsed = parse_genome(genome, genome_len, cfg)
-    state['n_regs'] = parsed['n_regs']
+    state['n_ses'] = parsed['n_ses']
+    state['separator_pos'] = parsed['separator_pos']
     state['n_instructions'] = parsed['n_instructions']
-    state['code_start'] = parsed['code_start']
-    state['instr_ops'] = parsed['instr_ops']
-    state['instr_args'] = parsed['instr_args']
-    state['instr_n_ops'] = parsed['instr_n_ops']
-    state['ip'] = jnp.int32(0)
-    
+    state['instruction_table'] = parsed['instruction_table']
+    state['instruction_lengths'] = parsed['instruction_lengths']
+
+    # IP starts right after separator
+    ip_start = (parsed['separator_pos'] + 1) % jnp.maximum(genome_len, 1)
+    state['se_values'] = state['se_values'].at[0].set(ip_start)
+
     return state
 
 
-def init_population(key: jax.Array, cfg: Config):
+def init_population(key, cfg):
     """Initialize population with ancestor genomes at random positions."""
     ancestor_genome, ancestor_len = create_ancestor_genome(cfg)
-    
-    # Select random indices for initial population
-    # We use random.choice without replacement logic (argsort shuffle)
-    # to ensure unique positions
+
     k1, k2 = random.split(key)
     perm = random.permutation(k1, cfg.pop_size)
-    # The first 'initial_pop' indices in the permutation are the alive ones
     alive_indices = perm[:cfg.initial_pop]
-    
-    # Create mask - tricky in JAX to be efficient?
-    # Actually, we can just say: if index i is in alive_indices, then alive=True.
-    # But checking "in" is O(N*M).
-    # Better: create bool array.
+
     is_alive = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
     is_alive = is_alive.at[alive_indices].set(True)
-    
-    # Generate random colors in HSV
-    # Hue: [0, 1] random
-    # Sat: [0.7, 1.0] random (vibrant)
-    # Val: [0.8, 1.0] random (bright)
-    h = random.uniform(k2, (cfg.pop_size, 1))
-    s = random.uniform(k2, (cfg.pop_size, 1), minval=0.7, maxval=1.0)
-    v = random.uniform(k2, (cfg.pop_size, 1), minval=0.8, maxval=1.0)
+
+    # Random HSV colors
+    k_h, k_s, k_v = random.split(k2, 3)
+    h = random.uniform(k_h, (cfg.pop_size, 1))
+    s = random.uniform(k_s, (cfg.pop_size, 1), minval=0.7, maxval=1.0)
+    v = random.uniform(k_v, (cfg.pop_size, 1), minval=0.8, maxval=1.0)
     colors = jnp.concatenate([h, s, v], axis=-1)
-    
+
     def init_one(i, alive_mask_val, col):
         state = init_organism(ancestor_genome, ancestor_len, col, cfg)
         state['alive'] = alive_mask_val
         return state
-    
+
     pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size), is_alive, colors)
     return pop
 
@@ -536,188 +1008,158 @@ def init_population(key: jax.Array, cfg: Config):
 # 8. CYCLE STEP (single cycle for all organisms)
 # ==========================================
 
-def cycle_step(cfg: Config, pop: dict, key: jax.Array):
+def cycle_step(cfg, pop, key):
     """Execute one cycle: step all organisms, handle births."""
-    
-    # Step all alive organisms that haven't reproduced yet
-    def step_one(state):
-        should_step = state['alive'] & ~state['has_child']
-        return lax.cond(
-            should_step,
-            lambda s: vm_step(s, cfg),
-            lambda s: s,
-            state
-        )
-    
-    pop = jax.vmap(step_one)(pop)
-    
-    # Age all alive organisms
+
+    k_exec, k_birth, k_place = random.split(key, 3)
+
+    # 1. Execute all alive organisms (steps_per_update steps each)
+    exec_keys = random.split(k_exec, cfg.pop_size)
+    pop = jax.vmap(lambda state, k: organism_update(state, k, cfg))(pop, exec_keys)
+
+    # 2. Age all alive organisms
     pop['age'] = jnp.where(pop['alive'], pop['age'] + 1, pop['age'])
-    
-    # Death by age
-    too_old = pop['age'] >= cfg.max_age
-    pop['alive'] = pop['alive'] & ~too_old
-    
-    # Collect births
+
+    # 3. Handle births
     has_child = pop['has_child']
     n_births = jnp.sum(has_child)
-    
-    # Mutate children
-    k_mut, k_place = random.split(key)
-    mut_keys = random.split(k_mut, cfg.pop_size)
-    
-    def mutate_one(args):
-        key, genome, length, color, has = args
-        return lax.cond(
-            has,
-            lambda g: mutate_genome(key, g[0], g[1], g[2], cfg),
-            lambda g: (g[0], g[1], g[2]),
-            (genome, length, color)
-        )
-    
-    mutated_genomes, mutated_lens, mutated_colors = jax.vmap(mutate_one)(
-        (mut_keys, pop['child_genome'], pop['child_len'], pop['color'], has_child)
+
+    # Prepare child tapes for organisms that divided
+    # Copy child + child_len into child_tape + child_tape_len
+    pop['child_tape'] = jnp.where(
+        has_child[:, None],
+        pop['child'],
+        pop['child_tape']
     )
-    
-    # Spatial Reproduction (Grid Physics)
-    # ... (omitted shared logic for brevity if needed, but here replacing full block)
-    # Treat 1D array as (H, W) grid
-    # For simplicity, let's assume square grid or close to it
+    pop['child_tape_len'] = jnp.where(
+        has_child,
+        pop['child_len'],
+        pop['child_tape_len']
+    )
+
+    # Apply divide mutations
+    mut_keys = random.split(k_birth, cfg.pop_size)
+
+    def mutate_one(mut_key, tape, tape_len, has, parent_color):
+        new_tape, new_len = apply_divide_mutations(mut_key, tape, tape_len, cfg)
+        new_color = mutate_color(mut_key, parent_color)
+        tape_out = jnp.where(has, new_tape, tape)
+        len_out = jnp.where(has, new_len, tape_len)
+        color_out = jnp.where(has, new_color, parent_color)
+        return tape_out, len_out, color_out
+
+    mutated_tapes, mutated_lens, child_colors = jax.vmap(mutate_one)(
+        mut_keys, pop['child_tape'], pop['child_tape_len'], has_child, pop['color']
+    )
+
+    # Spatial reproduction on 2D toroidal grid (OldestNurse)
     grid_side = int(np.ceil(np.sqrt(cfg.pop_size)))
-    # Ensure pop_size maps to grid exactly? 
-    # Current code allows any pop_size. For correct wrapping, we ideally want perfect square.
-    # But we can just use (H, W) where W = grid_side
     W = grid_side
-    H = (cfg.pop_size + W - 1) // W # Ceiling division
-    
-    # Indices 0..pop_size-1
-    # Check parents
+    H = (cfg.pop_size + W - 1) // W
+
     parent_indices = jnp.arange(cfg.pop_size)
-    
-    # We only care about parents who have a child
-    # has_child is mask
-    
-    # For EACH organism (whether parent or not, we can compute neighbors vectorized)
-    # Let's compute the "target slot" for every organism assuming it IS a parent
-    # Then mask by has_child
-    
-    # 1. Get neighbors indices (8 neighbors)
     y = parent_indices // W
     x = parent_indices % W
-    
+
     dy = jnp.array([-1, -1, -1, 0, 0, 1, 1, 1])
     dx = jnp.array([-1, 0, 1, -1, 1, -1, 0, 1])
-    
-    # Broadcast to (pop_size, 8)
+
     ny = (y[:, None] + dy[None, :]) % H
     nx = (x[:, None] + dx[None, :]) % W
-    
+
     neighbor_indices = ny * W + nx
-    
-    # Wrap handling: indices might be >= pop_size if pop_size isn't perfect rectangle/square fill
-    # Mask invalid neighbors (those beyond pop_size)
     neighbor_valid = neighbor_indices < cfg.pop_size
-    # If invalid, point to self or 0 (we will mask score anyway)
     neighbor_indices_safe = jnp.where(neighbor_valid, neighbor_indices, parent_indices[:, None])
-    
-    # 2. Get neighbor states
-    # We need: is_empty (not alive), age
+
     neighbor_alive = pop['alive'][neighbor_indices_safe]
     neighbor_age = pop['age'][neighbor_indices_safe]
-    
-    # 3. Score neighbors
-    # Priority 1: Empty (not alive). Score = Infinity (or very high)
-    # Priority 2: Oldest. Score = age
-    
-    # If neighbor invalid index, score = -1 (never pick)
-    # If neighbor empty: score = 1e9
-    # If neighbor alive: score = age
-    
+
+    # Score: empty cells get very high score, alive cells get their age
     base_score = jnp.where(neighbor_alive, neighbor_age.astype(jnp.float32), 1e9)
     valid_score = jnp.where(neighbor_valid, base_score, -1.0)
-    
-    # Break ties randomly: Add small random noise to scores
-    # Noise range: [0, 0.5) to avoid changing integer order (scores are integers or large)
+
+    # Break ties randomly
     noise = random.uniform(k_place, (cfg.pop_size, 8)) * 0.5
     final_score = valid_score + noise
-    
-    # 4. Select best target for each parent
-    # argmax gives index 0..7
+
     best_neighbor_local_idx = jnp.argmax(final_score, axis=1)
-    
-    # Gather the global index corresponding to that local idx
-    # neighbor_indices_safe is (N, 8)
-    # best_neighbor_local_idx is (N,)
-    target_indices = jnp.take_along_axis(neighbor_indices_safe, best_neighbor_local_idx[:, None], axis=1).squeeze(1)
-    
-    # 5. Prepare updates
-    # Only actual parents generate updates
-    # We have `mutated_genomes` and `mutated_lens` aligned with parents (0..N-1, valid if has_child)
-    
-    # Parse children genomes (aligned with parents)
-    child_parsed = jax.vmap(lambda g, l: parse_genome(g, l, cfg))(mutated_genomes, mutated_lens)
-    
-    # Build child states
+    target_indices = jnp.take_along_axis(
+        neighbor_indices_safe, best_neighbor_local_idx[:, None], axis=1
+    ).squeeze(1)
+
+    # Parse child genomes and build child states
+    child_parsed = jax.vmap(lambda g, l: parse_genome(g, l, cfg))(mutated_tapes, mutated_lens)
+
     def build_child_state(genome, genome_len, color, parsed):
         state = create_organism_state(cfg)
         state['genome'] = genome
         state['genome_len'] = genome_len
         state['color'] = color
-        state['n_regs'] = parsed['n_regs']
+        state['alive'] = jnp.bool_(True)
+        state['n_ses'] = parsed['n_ses']
+        state['separator_pos'] = parsed['separator_pos']
         state['n_instructions'] = parsed['n_instructions']
-        state['code_start'] = parsed['code_start']
-        state['instr_ops'] = parsed['instr_ops']
-        state['instr_args'] = parsed['instr_args']
-        state['instr_n_ops'] = parsed['instr_n_ops']
-        state['ip'] = parsed['code_start']
+        state['instruction_table'] = parsed['instruction_table']
+        state['instruction_lengths'] = parsed['instruction_lengths']
+        # IP starts right after separator
+        ip_start = (parsed['separator_pos'] + 1) % jnp.maximum(genome_len, 1)
+        state['se_values'] = state['se_values'].at[0].set(ip_start)
         return state
-        
-    child_states = jax.vmap(build_child_state)(mutated_genomes, mutated_lens, mutated_colors, child_parsed)
-    
-    # 6. Scatter updates
-    # We want to place `child_states` at `target_indices` where `has_child` is True.
-    # To handle the mask efficiently in JAX scatter, we map inputs such that:
-    # - If has_child: update = child_state (writes child to target)
-    # - If !has_child: update = pop (writes parent to self, effectively no-op)
-    
-    real_target_indices = jnp.where(has_child, target_indices, parent_indices)
 
-    # Better approach: map over (child_states, pop)
-    update_payload = jax.tree.map(
-        lambda c, p: jnp.where(
-            has_child.reshape((-1,) + (1,) * (c.ndim - 1)),
-            c,
-            p
-        ),
-        child_states,
-        pop
+    child_states = jax.vmap(build_child_state)(
+        mutated_tapes, mutated_lens, child_colors, child_parsed
     )
-    
-    # Now scatter
-    def scatter_update(current, update):
-        return current.at[real_target_indices].set(update)
-        
-    pop = jax.tree.map(lambda c, u: scatter_update(c, u), pop, update_payload)
-    
-    # 7. Post-reproduction cleanup
-    # Clear child buffer for parents that gave birth
-    empty_genome = jnp.full(cfg.max_genome_len, EMPTY, dtype=jnp.int32)
-    pop['child_genome'] = jnp.where(has_child[:, None], empty_genome, pop['child_genome'])
+
+    # Place children using gather approach (avoids scatter conflicts with duplicates)
+    # For each cell j, check if any birthing parent targets it
+    all_cells = jnp.arange(cfg.pop_size)
+    # targets_match[j, k] = True if parent k targets cell j AND has_child[k]
+    targets_match = (target_indices[None, :] == all_cells[:, None]) & has_child[None, :]
+    # any_child_placed[j] = True if any parent places a child at cell j
+    any_child_placed = jnp.any(targets_match, axis=1)
+    # source_parent[j] = index of (first) parent placing a child at cell j
+    source_parent = jnp.argmax(targets_match.astype(jnp.int32), axis=1)
+
+    # Gather child states from source parents
+    gathered_children = jax.tree.map(lambda x: x[source_parent], child_states)
+
+    # Conditionally replace: cell j gets child state if a child was placed, else keeps current
+    pop = jax.tree.map(
+        lambda c, p: jnp.where(
+            any_child_placed.reshape((-1,) + (1,) * (c.ndim - 1)),
+            c, p
+        ),
+        gathered_children, pop
+    )
+
+    # Post-reproduction cleanup: reset parent's child state
+    blank_child = jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32)
+    pop['child'] = jnp.where(has_child[:, None], blank_child, pop['child'])
     pop['child_len'] = jnp.where(has_child, jnp.int32(0), pop['child_len'])
-    
-    # Reset has_child for everyone for next cycle
+    pop['child_copied'] = jnp.where(
+        has_child[:, None],
+        jnp.zeros(cfg.max_genome_len, dtype=jnp.bool_),
+        pop['child_copied']
+    )
+    pop['already_allocated'] = jnp.where(has_child, jnp.bool_(False), pop['already_allocated'])
     pop['has_child'] = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
-    
+    pop['child_tape'] = jnp.where(
+        has_child[:, None],
+        jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32),
+        pop['child_tape']
+    )
+    pop['child_tape_len'] = jnp.where(has_child, jnp.int32(0), pop['child_tape_len'])
+
     # Stats
     alive_count = jnp.sum(pop['alive'])
     avg_genome_len = jnp.sum(jnp.where(pop['alive'], pop['genome_len'], 0)) / jnp.maximum(alive_count, 1)
-    
+
     stats = {
         'pop_size': alive_count,
         'births': n_births,
         'avg_genome_len': avg_genome_len,
     }
-    
+
     return pop, stats
 
 
@@ -736,14 +1178,14 @@ def plot_metrics(timestamps, pop_sizes, avg_lens, filename="metrics.png"):
     ax1.tick_params(axis='y', labelcolor=color)
     ax1.grid(True, alpha=0.3)
 
-    ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+    ax2 = ax1.twinx()
     color = 'tab:red'
-    ax2.set_ylabel('Avg Genome Length', color=color)  # we already handled the x-label with ax1
+    ax2.set_ylabel('Avg Genome Length', color=color)
     ax2.plot(timestamps, avg_lens, color=color, linestyle='--', label='Avg Len')
     ax2.tick_params(axis='y', labelcolor=color)
 
     plt.title('Simulation Metrics')
-    fig.tight_layout()  # otherwise the right y-label is slightly clipped
+    fig.tight_layout()
     plt.savefig(filename)
     plt.close()
     print(f"Saved metrics plot to {filename}")
@@ -753,91 +1195,62 @@ def save_grid_gif(snapshots, filename, cfg):
     """Generate a GIF of the 2D grid representation."""
     print("Generating GIF...")
     frames = []
-    
-    # Calculate grid dimensions (approx square)
     grid_side = int(np.ceil(np.sqrt(cfg.pop_size)))
-    
-    # Find max genome len for normalization
     max_len = cfg.max_genome_len
-    
+
     for i, snap in enumerate(snapshots):
         alive_mask = snap['alive']
         genome_lens = snap['genome_len']
-        
-        # Create grid images
-        # 1. Filter metrics to grid size (pad if needed)
         pad_size = grid_side * grid_side - cfg.pop_size
-        
-        # Prepare data
+
         alive_grid = np.pad(alive_mask, (0, pad_size), constant_values=False).reshape(grid_side, grid_side)
-        
+
         if cfg.use_species_color and 'color' in snap:
-            # Use species color (HSV)
-            colors = snap['color'] # (N, 3) HSV
-            
-            # Pad colors
-            # pad with 0s
+            colors = snap['color']
             colors_padded = np.pad(colors, ((0, pad_size), (0, 0)), constant_values=0.0)
             hsv_grid = colors_padded.reshape(grid_side, grid_side, 3)
-            
-            # Convert HSV to RGB
-            rgb_grid = mcolors.hsv_to_rgb(hsv_grid)
-            rgb = rgb_grid
+            rgb = mcolors.hsv_to_rgb(hsv_grid)
         else:
-            # Use genome length heatmap
             len_grid = np.pad(genome_lens, (0, pad_size), constant_values=0).reshape(grid_side, grid_side)
-            
-            # Create RGB image
-            # Background: Black (0,0,0) or Very Dark Gray
-            # Alive: Colored by length (Blue -> Red via Viridis or similar)
-            
-            # Normalize length for color mapping (0 to max_genome_len)
             norm_len = np.clip(len_grid / max_len, 0, 1)
-            
-            # Use a colormap
             cmap = plt.get_cmap('viridis')
-            rgba = cmap(norm_len)  # (N, N, 4)
-            rgb = rgba[..., :3] # (N, N, 3)
-        
-        # Vectorized masking
+            rgba = cmap(norm_len)
+            rgb = rgba[..., :3]
+
         mask = alive_grid[..., None]
-        final_img = np.where(mask, rgb, 0.0) # Black background for dead
-        
-        # Upscale for visibility?
-        # Let's keep 1 pixel per cell for now, maybe use matplotlib to save frame
-        
+        final_img = np.where(mask, rgb, 0.0)
+
         fig, ax = plt.subplots(figsize=(6, 6))
         ax.imshow(final_img, interpolation='nearest')
         ax.axis('off')
         ax.set_title(f"Cycle {snap['cycle']}")
-        
-        # Save to buffer
+
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
         plt.close()
         buf.seek(0)
-        
+
         frames.append(imageio.imread(buf) if imageio else np.array(Image.open(buf)))
-        
+
     if imageio:
         imageio.mimsave(filename, frames, fps=10)
         print(f"Saved GIF to {filename}")
     else:
-        print("imageio not installed, saving frames as separate images not implemented for simplicity.")
+        print("imageio not installed, cannot save GIF.")
 
 
 # ==========================================
 # 10. MAIN SIMULATION
 # ==========================================
 
-def run_simulation(key: jax.Array, cfg: Config, total_cycles: int, 
-                   log_interval: int = 10000, use_wandb: bool = False):
+def run_simulation(key, cfg, total_cycles, log_interval=10000, use_wandb=False):
     """Run the simulation for total_cycles."""
     print(f"=== JAX PHYSIS SIMULATION ===")
     print(f"Population capacity: {cfg.pop_size}, Initial: {cfg.initial_pop}")
+    print(f"Steps per update: {cfg.steps_per_update}")
     print(f"Total cycles: {total_cycles}, Log interval: {log_interval}")
     print()
-    
+
     if use_wandb:
         if not WANDB_AVAILABLE:
             print("WARNING: wandb not installed. Run: pip install wandb")
@@ -850,51 +1263,46 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
                     "pop_size": cfg.pop_size,
                     "initial_pop": cfg.initial_pop,
                     "max_genome_len": cfg.max_genome_len,
-                    "max_age": cfg.max_age,
-                    "point_mutation_rate": cfg.point_mutation_rate,
-                    "indel_rate": cfg.indel_rate,
+                    "steps_per_update": cfg.steps_per_update,
+                    "copy_mutation_rate": cfg.copy_mutation_rate,
+                    "divide_insert_rate": cfg.divide_insert_rate,
+                    "divide_delete_rate": cfg.divide_delete_rate,
                 }
             )
-    
-    # Initialize
+
     k1, k2 = random.split(key)
     pop = init_population(k1, cfg)
-    
-    # JIT compile the cycle step
+
     cycle_step_fn = partial(cycle_step, cfg)
-    
+
     def scan_cycles(pop, keys):
         def step(pop, key):
             pop, stats = cycle_step_fn(pop, key)
             return pop, stats
         return lax.scan(step, pop, keys)
-    
+
     jit_scan = jax.jit(scan_cycles)
-    
-    # Run in chunks for logging
+
     n_chunks = total_cycles // log_interval
     all_stats = []
-    
     cycle_keys = random.split(k2, total_cycles)
-    
+
     try:
         for chunk in trange(n_chunks, desc="Running"):
             start = chunk * log_interval
             end = (chunk + 1) * log_interval
             chunk_keys = cycle_keys[start:end]
-            
+
             pop, stats = jit_scan(pop, chunk_keys)
-            # Block until computed
             pop = jax.block_until_ready(pop)
-            
-            # Log last stats of chunk
+
             cycle_num = end
             pop_size = int(stats['pop_size'][-1])
             births = int(jnp.sum(stats['births']))
             avg_len = float(stats['avg_genome_len'][-1])
-            
+
             print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, AvgLen={avg_len:.1f}")
-            
+
             if use_wandb:
                 wandb.log({
                     "cycle": cycle_num,
@@ -902,15 +1310,14 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
                     "population/births_interval": births,
                     "genome/avg_len": avg_len,
                 })
-            
-            # Collect snapshot for this chunk (end state)
+
             snapshot = {
                 'cycle': cycle_num,
                 'alive': np.array(pop['alive']),
                 'genome_len': np.array(pop['genome_len']),
                 'color': np.array(pop['color'])
             }
-            
+
             chunk_rec = {
                 'cycle': cycle_num,
                 'pop_size': pop_size,
@@ -918,15 +1325,14 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
                 'avg_len': avg_len,
                 'snapshot': snapshot
             }
-            
+
             all_stats.append(chunk_rec)
     except KeyboardInterrupt:
         print("Simulation interrupted by user.")
-            
-    
+
     if use_wandb:
         wandb.finish()
-    
+
     return pop, all_stats
 
 
@@ -935,18 +1341,15 @@ def run_simulation(key: jax.Array, cfg: Config, total_cycles: int,
 # ==========================================
 if __name__ == "__main__":
     cfg = make_config(
-        pop_size=4096,
-        initial_pop=4,
-        max_age=jnp.inf,
-        point_mutation_rate=0.05,
-        indel_rate=0.2,
+        pop_size=256,
+        initial_pop=1,
     )
 
     key = random.PRNGKey(42)
     pop, stats = run_simulation(
-        key, 
-        cfg, 
-        total_cycles=50_000,
+        key,
+        cfg,
+        total_cycles=2_000,
         log_interval=100,
         use_wandb=False,
     )
@@ -956,18 +1359,14 @@ if __name__ == "__main__":
     alive_count = jnp.sum(alive)
     avg_len = jnp.sum(jnp.where(alive, pop['genome_len'], 0)) / jnp.maximum(alive_count, 1)
 
+    print(f"Alive: {int(alive_count)}")
     print(f"Avg genome length: {float(avg_len):.1f}")
 
-    # Plotting and GIF generation
     timestamps = [s['cycle'] for s in stats]
     pop_sizes = [s['pop_size'] for s in stats]
     avg_lens = [s['avg_len'] for s in stats]
-    
-    # 1. Plot metrics
+
     plot_metrics(timestamps, pop_sizes, avg_lens, "simulation_metrics.png")
-    
-    # 2. Generate GIF
-    # We collected snapshots in stats['snapshots'] (added in run_simulation)
-    # Extract snapshots
+
     snapshots = [s['snapshot'] for s in stats]
     save_grid_gif(snapshots, "evolution.gif", cfg)
