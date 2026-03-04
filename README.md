@@ -32,21 +32,21 @@ Both systems show the same qualitative dynamics: logistic population growth from
 |---|---|
 | ![Physis](experiment_results/physis_run.gif) | ![Physax](experiment_results/physax_run.gif) |
 
-16x16 toroidal grid, 1000 cycles. Colors represent species lineage (offspring inherit parent color with slight HSV drift on mutation).
+16x16 toroidal grid, 1000 cycles. 3-panel Physis-style visualization showing **Fitness** (executed instructions / gestation time), **Merit** (count of executed genome positions), and **Age**. Dead cells are black, newborns gray, fertile organisms colored on a dark blue → blue → cyan → green → yellow → red → pink spectrum matching the original Java Physis `ColorRange`.
 
 ## Architecture
 
-The entire simulation lives in a single file: **`physax.py`** (~700 lines), organized into sections:
+The entire simulation lives in a single file: **`physax.py`** (~1500 lines), organized into sections:
 
 1. **Constants** -- ARCHE instruction set (44 opcodes) with operand counts
 2. **Configuration** -- Simulation parameters (mutation rates, scheduler, allocation limits)
 3. **Organism State** -- JAX array-based state: genome, structural elements, instruction table, child tape
 4. **Genome Parsing** -- `build_structure()` and `build_instruction_set()` extract phenotype from genome
-5. **VM Execution** -- `vm_execute_one()` executes compound instructions with unified parent/child address space
+5. **VM Execution** -- `vm_execute_one()` executes compound instructions with unified parent/child address space, tracks executed genome positions
 6. **Mutation** -- Copy mutation on child writes (0.009), divide insertion/deletion (0.0013)
 7. **Population Init** -- Seed with the 78-gene `arche.replicator` ancestor
 8. **Cycle Step** -- Execute all organisms, handle births with OldestNurse spatial placement
-9. **Visualization** -- Metrics plots and animated GIF generation
+9. **Visualization** -- Metrics plots, Physis-style 3-panel (Fitness|Merit|Age) GIF generation, and species-colored grid GIFs
 10. **Main Simulation** -- JIT-compiled `lax.scan` chunks with optional W&B logging
 
 ### Key Design Choices
