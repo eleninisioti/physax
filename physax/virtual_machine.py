@@ -166,39 +166,6 @@ class VirtualMachine:
 
         final_ctx, _ = lax.scan(micro_op_step, init_ctx, jnp.arange(self.cfg.max_micro_ops))
 
-        # Post micro-ops: IP += 1 unless divide returned
-        # In UP.java: after the while loop, incrementIP(1) is called.
-        # But JUMP sets IP directly (and the +1 still applies after).
-        # And DIVIDE returns early (no +1).
-        # IFZERO/IFNOTZERO already added their +1 to IP inside the loop.
-        # So: IP += 1 unconditionally, unless divide_returned.
-        # But if JUMP happened, IP was already set to target in the loop.
-        # The +1 still applies! In UP.java, jump() calls setIP(), then execute() does incrementIP(1).
-        # Wait — actually DIVIDE calls return before incrementIP. Let me re-read.
-        # In UP.java execute(): the DIVIDE case does return (exits execute method),
-        # so incrementIP(1) at the bottom is NOT reached for DIVIDE.
-        # For JUMP: setIP(target), then incrementIP(1) is called. So effective IP = target + 1? No!
-        # Actually wait — looking at UP.java more carefully:
-        # jump() calls setIP(ses[address % ssize].read()) which directly sets IP.value
-        # Then after the while loop, incrementIP(1) adds 1 to IP.
-        # So yes, IP ends up at target + 1 after a jump. But wait... that seems wrong for the ancestor.
-        # Let me check: instruction 6 is "jump 3" which means jump to SE[3].
-        # But the ancestor's usage: SE[3] is the "return_reg" which stores the IP value.
-        # The ancestor's instruction 2 does "move 0 3" which copies IP (SE[0]) to SE[3].
-        # Then later instruction 6 does "jump 3" meaning IP = SE[3]. Then +1 is applied.
-        # So if SE[3] stored the IP of instruction 2's execution, the jump goes to SE[3]+1.
-        # Actually, in UP.java, IP is set via setIP then incrementIP(1) after the while loop.
-        # BUT: the jump instruction inside the while loop sets IP. The while loop continues
-        # executing remaining micro-ops in the compound instruction. Then incrementIP(1).
-        # So effective: IP_final = (whatever IP was after all micro-ops in the instruction) + 1
-        # For jump specifically: IP = SE[addr], then after loop: IP += 1
-        #
-        # OK but there's a subtlety: does the while loop continue after jump?
-        # Yes! There's no break/return for JUMP — it just sets IP and continues to next micro-op.
-        # Only DIVIDE does return.
-        #
-        # So the +1 applies to whatever IP is at the end of the compound instruction.
-
         new_ip = final_ctx.se_vals[0] + 1
         new_ip = jnp.where(final_ctx.divide_returned, final_ctx.se_vals[0], new_ip)
 
