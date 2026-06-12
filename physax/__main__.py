@@ -1,10 +1,9 @@
 import jax
 import jax.numpy as jnp
 from jax import random
-from physax.config import make_config
-from physax.simulation import run_simulation
-from physax.viz import plot_metrics, save_grid_gif, save_physis_view_gif
-from physax.constants import PERCENTILES
+from physax.config import make_config, PERCENTILES
+from physax.model import run_simulation
+from physax.visualization import plot_metrics, save_grid_gif, save_physis_view_gif
 # SS: print whether running on cpu or gpu
 print('device:', jax.devices()[0].platform)
 

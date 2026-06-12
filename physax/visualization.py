@@ -7,25 +7,11 @@ try:
     import imageio.v2 as imageio
 except ImportError:
     imageio = None
-from physax.constants import LS, PERCENTILES
 
-def compute_snapshot_properties(snap, max_genome_len):
-    """Compute fitness, merit, and effective length from a snapshot dict.
-    Pure NumPy, called at snapshot time (not JIT'd).
-    Returns (effective_length, merit, fitness, fertile) arrays of shape (pop_size,).
-    """
-    mask = np.arange(max_genome_len)[None, :] < snap['genome_len'][:, None]
-    effective_length = np.sum(snap['executed'] & mask, axis=1)
-    merit = effective_length.astype(np.float64)  # bonus=1.0, no tasks
-    gt = snap['gestation_time']
-    INVALID = 2147483647
-    fertile = gt < INVALID
-    fitness = np.where(fertile, merit / np.maximum(gt, 1).astype(np.float64), 0.0)
-    return effective_length, merit, fitness, fertile
+from physax.config import LS, PERCENTILES
+from physax.analysis import compute_snapshot_properties
 
 
-# SS: use percentiles not avg -- include births
-#def plot_metrics(timestamps, pop_sizes, avg_lens, filename="metrics.png"):
 def plot_metrics(timestamps, pop_sizes, births, q_lens, filename="metrics.png"):
     """Plot population size and average genome length over time."""
 
@@ -237,5 +223,6 @@ def save_physis_view_gif(snapshots, filename, cfg, view_mode='all'):
 
     imageio.mimsave(filename, frames, fps=10)
     print(f"Saved physis-view GIF to {filename}")
+
 
 

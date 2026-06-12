@@ -3,90 +3,17 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
-from physax.constants import *
-from physax.state import create_organism_state
-from physax.parser import parse_genome
-from physax.vm import organism_update
-from physax.mutations import apply_divide_mutations, mutate_color
+from functools import partial
+from tqdm import trange
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
-def create_ancestor_genome(cfg):
-    """Create the 78-gene arche.replicator ancestor genome."""
-    # Hardcoded from physis/data/genebank/arche/arche.replicator
-    g = jnp.array([
-        R, B, R, B, R, B, R,                           # Structure: 4 registers (+ IP = 5 SEs)
-        I, MOVE, NOP, 2,                                # I0: move 0 2 (store_ptr)
-        I, CLEAR, 1,                                    # I1: clear 1 (clear_counter)
-        I, MOVE, NOP, 3,                                # I2: move 0 3 (s_lab: store IP to return_reg)
-        I, INC, 1,                                      # I3: inc 1 (inc_counter)
-        I, CINC, 2,                                     # I4: cinc 2 (cinc_pointer)
-        I, LOAD, 2, 4, IS_SEP, 4, 4, IFZERO, 4,        # I5: load 2 4; is_sep 4 4; ifzero 4
-        I, JUMP, 3,                                     # I6: jump 3 (jump_by_reg)
-        I, ALLOCATE, 1,                                 # I7: allocate 1
-        I, MOVE, 1, 2,                                  # I8: move 1 2 (fill_pointer)
-        I, LOAD, 1, 4,                                  # I9: load 1 4 (load_data)
-        I, REL_STORE, 1, 2, 4,                          # I10: rel_store 1 2 4
-        I, DEC, 1,                                      # I11: dec 1
-        I, IFNOTZERO, 1,                                # I12: ifnotzero 1
-        I, DIVIDE,                                      # I13: divide
-        SEP,                                            # Separator at position 60
-        # Code section (positions 61-77): 17 entries mapping to 14 instructions
-        0, 1, 2, 3, 4, 5, 6, 3, 7, 8, 2, 11, 9, 10, 12, 6, 13
-    ], dtype=jnp.int32)
-
-    genome = jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32)
-    genome = genome.at[:len(g)].set(g)
-    genome_len = jnp.int32(len(g))
-
-    return genome, genome_len
-
-
-def init_organism(genome, genome_len, color, cfg):
-    """Initialize an organism from a genome."""
-    state = create_organism_state(cfg)
-    state['genome'] = genome
-    state['genome_len'] = genome_len
-    state['color'] = color
-
-    parsed = parse_genome(genome, genome_len, cfg)
-    state['n_ses'] = parsed['n_ses']
-    state['separator_pos'] = parsed['separator_pos']
-    state['n_instructions'] = parsed['n_instructions']
-    state['instruction_table'] = parsed['instruction_table']
-    state['instruction_lengths'] = parsed['instruction_lengths']
-
-    # IP starts right after separator
-    ip_start = (parsed['separator_pos'] + 1) % jnp.maximum(genome_len, 1)
-    state['se_values'] = state['se_values'].at[0].set(ip_start)
-
-    return state
-
-
-def init_population(key, cfg):
-    """Initialize population with ancestor genomes at random positions."""
-    ancestor_genome, ancestor_len = create_ancestor_genome(cfg)
-
-    k1, k2 = random.split(key)
-    perm = random.permutation(k1, cfg.pop_size)
-    alive_indices = perm[:cfg.initial_pop]
-
-    is_alive = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
-    is_alive = is_alive.at[alive_indices].set(True)
-
-    # Random HSV colors
-    k_h, k_s, k_v = random.split(k2, 3)
-    h = random.uniform(k_h, (cfg.pop_size, 1))
-    s = random.uniform(k_s, (cfg.pop_size, 1), minval=0.7, maxval=1.0)
-    v = random.uniform(k_v, (cfg.pop_size, 1), minval=0.8, maxval=1.0)
-    colors = jnp.concatenate([h, s, v], axis=-1)
-
-    def init_one(i, alive_mask_val, col):
-        state = init_organism(ancestor_genome, ancestor_len, col, cfg)
-        state['alive'] = alive_mask_val
-        return state
-
-    pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size), is_alive, colors)
-    return pop
-
+from physax.config import *
+from physax.agent import create_organism_state, parse_genome, apply_divide_mutations, init_organism, create_ancestor_genome
+from physax.virtual_machine import organism_update
 
 
 def cycle_step(cfg, pop, key):
@@ -120,6 +47,17 @@ def cycle_step(cfg, pop, key):
 
     # Apply divide mutations
     mut_keys = random.split(k_birth, cfg.pop_size)
+
+    def mutate_color(key, color):
+        """Apply small HSV drift to color for lineage tracking."""
+        k1, k2 = random.split(key)
+        noise_h = random.uniform(k1, (1,), minval=-0.05, maxval=0.05)
+        noise_sv = random.uniform(k2, (2,), minval=-0.02, maxval=0.02)
+        noise = jnp.concatenate([noise_h, noise_sv])
+        h = (color[0] + noise[0]) % 1.0
+        s = jnp.clip(color[1] + noise[1], 0.0, 1.0)
+        v = jnp.clip(color[2] + noise[2], 0.0, 1.0)
+        return jnp.array([h, s, v])
 
     def mutate_one(mut_key, tape, tape_len, has, parent_color):
         new_tape, new_len = apply_divide_mutations(mut_key, tape, tape_len, cfg)
@@ -251,3 +189,128 @@ def cycle_step(cfg, pop, key):
     return pop, stats
 
 
+def init_population(key, cfg):
+    """Initialize population with ancestor genomes at random positions."""
+    ancestor_genome, ancestor_len = create_ancestor_genome(cfg)
+
+    k1, k2 = random.split(key)
+    perm = random.permutation(k1, cfg.pop_size)
+    alive_indices = perm[:cfg.initial_pop]
+
+    is_alive = jnp.zeros(cfg.pop_size, dtype=jnp.bool_)
+    is_alive = is_alive.at[alive_indices].set(True)
+
+    # Random HSV colors
+    k_h, k_s, k_v = random.split(k2, 3)
+    h = random.uniform(k_h, (cfg.pop_size, 1))
+    s = random.uniform(k_s, (cfg.pop_size, 1), minval=0.7, maxval=1.0)
+    v = random.uniform(k_v, (cfg.pop_size, 1), minval=0.8, maxval=1.0)
+    colors = jnp.concatenate([h, s, v], axis=-1)
+
+    def init_one(i, alive_mask_val, col):
+        state = init_organism(ancestor_genome, ancestor_len, col, cfg)
+        state['alive'] = alive_mask_val
+        return state
+
+    pop = jax.vmap(init_one)(jnp.arange(cfg.pop_size), is_alive, colors)
+    return pop
+
+
+def run_simulation(key, cfg, total_cycles, log_interval=10000, use_wandb=False):
+    """Run the simulation for total_cycles."""
+    print(f"=== JAX PHYSIS SIMULATION ===")
+    print(f"Population capacity: {cfg.pop_size}, Initial: {cfg.initial_pop}")
+    print(f"Steps per update: {cfg.steps_per_update}")
+    print(f"Total cycles: {total_cycles}, Log interval: {log_interval}")
+    print()
+
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            print("WARNING: wandb not installed. Run: pip install wandb")
+            use_wandb = False
+        else:
+            wandb.init(
+                project="physis-jax",
+                config={
+                    "total_cycles": total_cycles,
+                    "pop_size": cfg.pop_size,
+                    "initial_pop": cfg.initial_pop,
+                    "max_genome_len": cfg.max_genome_len,
+                    "steps_per_update": cfg.steps_per_update,
+                    "copy_mutation_rate": cfg.copy_mutation_rate,
+                    "divide_insert_rate": cfg.divide_insert_rate,
+                    "divide_delete_rate": cfg.divide_delete_rate,
+                }
+            )
+
+    k1, k2 = random.split(key)
+    pop = init_population(k1, cfg)
+
+    cycle_step_fn = partial(cycle_step, cfg)
+
+    def scan_cycles(pop, keys):
+        def step(pop, key):
+            pop, stats = cycle_step_fn(pop, key)
+            return pop, stats
+        return lax.scan(step, pop, keys)
+
+    jit_scan = jax.jit(scan_cycles)
+
+    n_chunks = total_cycles // log_interval
+    all_stats = []
+    cycle_keys = random.split(k2, total_cycles)
+
+    try:
+        for chunk in trange(n_chunks, desc="Running"):
+            start = chunk * log_interval
+            end = (chunk + 1) * log_interval
+            chunk_keys = cycle_keys[start:end]
+
+            pop, stats = jit_scan(pop, chunk_keys)
+            pop = jax.block_until_ready(pop)
+
+            cycle_num = end
+            pop_size = int(stats['pop_size'][-1])
+            births = int(jnp.sum(stats['births']))
+            #avg_len = float(stats['avg_genome_len'][-1])
+            q_len = stats['q_genome_len'][-1]
+
+            # SS: print percentiles, not avg
+            #print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, AvgLen={avg_len:.1f}")
+            print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, percentiles={q_len}")
+
+            if use_wandb:
+                wandb.log({
+                    "cycle": cycle_num,
+                    "population/size": pop_size,
+                    "population/births_interval": births,
+                    # SS: use median from percentiles: INDEX MAY CHANGE IF DIFFERENT PERCENTILES USED
+                    #"genome/avg_len": avg_len,
+                    "genome/avg_len": q_len[3],
+                })
+
+            snapshot = {
+                'cycle': cycle_num,
+                'alive': np.array(pop['alive']),
+                'genome_len': np.array(pop['genome_len']),
+                'color': np.array(pop['color'])
+            }
+
+            chunk_rec = {
+                'cycle': cycle_num,
+                'pop_size': pop_size,
+                'births': births,
+                # SS: record percentiles, not avg
+                #'avg_len': avg_len,
+                'q_len': q_len,
+                'snapshot': snapshot
+            }
+
+            all_stats.append(chunk_rec)
+    except KeyboardInterrupt:
+        print("Simulation interrupted by user.")
+
+    if use_wandb:
+        wandb.finish()
+
+    return pop, all_stats

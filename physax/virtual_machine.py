@@ -2,7 +2,25 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
-from physax.constants import *
+from physax.config import *
+
+
+def organism_update(state, key, cfg):
+    """Execute steps_per_update compound instructions on one organism."""
+    def step_fn(state, step_key):
+        should_exec = state['alive'] & ~state['has_child']
+        new_state = vm_execute_one(state, step_key, cfg)
+        # Only apply if should execute
+        result = jax.tree.map(
+            lambda n, o: jnp.where(should_exec, n, o),
+            new_state, state
+        )
+        return result, None
+
+    keys = random.split(key, cfg.steps_per_update)
+    state, _ = lax.scan(step_fn, state, keys)
+    return state
+
 
 def tape_read(genome, genome_len, child, child_len, already_allocated, position):
     """Unified address space read. Matches CellGeneticCodeTape.read().
@@ -505,22 +523,3 @@ def vm_execute_one(state, key, cfg):
     new_state['gestation_time'] = gestation_time
     new_state['executed'] = executed
     return new_state
-
-
-def organism_update(state, key, cfg):
-    """Execute steps_per_update compound instructions on one organism."""
-    def step_fn(state, step_key):
-        should_exec = state['alive'] & ~state['has_child']
-        new_state = vm_execute_one(state, step_key, cfg)
-        # Only apply if should execute
-        result = jax.tree.map(
-            lambda n, o: jnp.where(should_exec, n, o),
-            new_state, state
-        )
-        return result, None
-
-    keys = random.split(key, cfg.steps_per_update)
-    state, _ = lax.scan(step_fn, state, keys)
-    return state
-
-
