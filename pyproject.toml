@@ -1,0 +1,24 @@
+[project]
+name = "physax"
+version = "0.1.0"
+description = "Physax project"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "imageio[ffmpeg]",
+    "jax[cuda12]",
+    "matplotlib",
+    "numpy",
+    "pillow",
+    "torch>=2.5.1",
+    "tqdm",
+    "wandb",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
