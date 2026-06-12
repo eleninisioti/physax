@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax import random
 from physax.config import make_config, PERCENTILES
-from physax.model import run_simulation
+from physax.model import Model
 from physax.visualization import plot_metrics, save_grid_gif, save_physis_view_gif
 # SS: print whether running on cpu or gpu
 print('device:', jax.devices()[0].platform)
@@ -18,10 +18,10 @@ if __name__ == "__main__":
         initial_pop=10,
     )
 
+    model = Model(cfg)
     key = random.PRNGKey(42)
-    pop, stats = run_simulation(
+    pop, stats = model.run_simulation(
         key,
-        cfg,
         #total_cycles=2000,
         total_cycles=10_000,
         #log_interval=50,
@@ -30,11 +30,11 @@ if __name__ == "__main__":
     )
 
     print("\n=== FINAL STATE ===")
-    alive = pop['alive']
+    alive = pop.alive
     alive_count = jnp.sum(alive)
     # SS: use percentiles, not avg
-    #avg_len = jnp.sum(jnp.where(alive, pop['genome_len'], 0)) / jnp.maximum(alive_count, 1)
-    q_lens = jnp.nanpercentile(jnp.where(alive, pop['genome_len'], jnp.nan), PERCENTILES )
+    #avg_len = jnp.sum(jnp.where(alive, pop.genome_len, 0)) / jnp.maximum(alive_count, 1)
+    q_lens = jnp.nanpercentile(jnp.where(alive, pop.genome_len, jnp.nan), PERCENTILES )
 
     print(f"Alive: {int(alive_count)}")
     # SS: use percentiles, not avg

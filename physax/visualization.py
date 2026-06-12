@@ -12,6 +12,8 @@ from physax.config import LS, PERCENTILES
 from physax.analysis import compute_snapshot_properties
 
 
+# SS: use percentiles not avg -- include births
+#def plot_metrics(timestamps, pop_sizes, avg_lens, filename="metrics.png"):
 def plot_metrics(timestamps, pop_sizes, births, q_lens, filename="metrics.png"):
     """Plot population size and average genome length over time."""
 
