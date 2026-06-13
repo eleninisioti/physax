@@ -16,6 +16,27 @@ from physax.agent import Agent
 from physax.virtual_machine import VirtualMachine
 
 
+import numpy as np
+
+global_genomes = {
+    WELL_BEHAVED: {},
+    POORLY_BEHAVED: {},
+    FAILED: {}
+}
+
+def collect_genomes(hashes, genomes, statuses, valid_mask):
+    hashes_np = np.array(hashes)
+    genomes_np = np.array(genomes)
+    statuses_np = np.array(statuses)
+    valid_mask_np = np.array(valid_mask)
+    
+    valid_indices = np.where(valid_mask_np)[0]
+    for idx in valid_indices:
+        h_val = int(hashes_np[idx])
+        st_val = int(statuses_np[idx])
+        if h_val not in global_genomes[st_val]:
+            global_genomes[st_val][h_val] = np.copy(genomes_np[idx])
+
 class Model:
     """Simulation manager tying together configuration, VM, and Agent population."""
     
@@ -42,7 +63,11 @@ class Model:
         colors = jnp.concatenate([h, s, v], axis=-1)
 
         def init_one(i, alive_mask_val, col):
-            state = Agent.init_organism(ancestor_genome, ancestor_len, col, self.cfg)
+            state = Agent.init_organism(
+                ancestor_genome, ancestor_len, col, 
+                jnp.int32(-1), jnp.int32(UNCLASSIFIED), jnp.int32(-1), 
+                self.cfg
+            )
             return state._replace(alive=alive_mask_val)
 
         pop = jax.vmap(init_one)(jnp.arange(self.cfg.pop_size), is_alive, colors)
@@ -100,13 +125,14 @@ class Model:
         gathered_children = jax.tree.map(lambda x: x[source_parent], child_states)
 
         # Conditionally replace: cell j gets child state if a child was placed, else keeps current
-        return jax.tree.map(
+        new_pop = jax.tree.map(
             lambda c, p: jnp.where(
                 any_child_placed.reshape((-1,) + (1,) * (c.ndim - 1)),
                 c, p
             ),
             gathered_children, pop
         )
+        return new_pop, any_child_placed
 
     def cycle_step(self, pop: Agent, key) -> tuple[Agent, dict]:
         """Execute one cycle: step all organisms, handle births."""
@@ -114,12 +140,104 @@ class Model:
         k_exec, k_birth, k_place = random.split(key, 3)
 
         # 1. Execution Phase
-        # 1. Execute all alive organisms (steps_per_update steps each)
+        # Fast Track: WELL_BEHAVED and FAILED
+        is_well_behaved = pop.status == WELL_BEHAVED
+        is_failed = pop.status == FAILED
+        
+        fast_age = jnp.where(
+            pop.alive & (is_well_behaved | is_failed),
+            pop.age + 1,
+            pop.age
+        )
+        
+        # Gestation time is the number of cycles it took to reproduce.
+        # It should reproduce every `gestation_time` cycles.
+        fast_divide = pop.alive & is_well_behaved & (pop.gestation_time > 0) & ((fast_age % pop.gestation_time) == 0)
+        
+        pop = pop._replace(
+            age=fast_age,
+            has_child=fast_divide,
+            # We must output the base_child to child_tape during birth phase. It is stored in child array.
+        )
+        
+        # Slow Track: POORLY_BEHAVED and UNCLASSIFIED (must be alive!)
+        is_slow = pop.alive & ((pop.status == POORLY_BEHAVED) | (pop.status == UNCLASSIFIED))
+        
+        MAX_SLOW = 256 * 10  # 4096
+        
+        # Sort so that True (slow) comes FIRST! (False sorts before True)
+        sort_idx = jnp.argsort(~is_slow) 
         exec_keys = random.split(k_exec, self.cfg.pop_size)
-        pop = jax.vmap(self.vm.update)(pop, exec_keys)
+        
+        def process_slow(p, keys):
+            p_sorted = jax.tree.map(lambda x: x[sort_idx], p)
+            k_sorted = keys[sort_idx]
+            
+            p_slow = jax.tree.map(lambda x: x[:MAX_SLOW], p_sorted)
+            k_slow = k_sorted[:MAX_SLOW]
+            
+            # Execute VM on exactly MAX_SLOW organisms natively!
+            p_exec = jax.vmap(self.vm.update)(p_slow, k_slow)
+            
+            # Reconstruct sorted array
+            p_updated = jax.tree.map(
+                lambda updated, orig: jnp.concatenate([updated, orig[MAX_SLOW:]], axis=0),
+                p_exec, p_sorted
+            )
+            
+            # Restore original order
+            unsort_idx = jnp.argsort(sort_idx)
+            p_updated_orig = jax.tree.map(lambda x: x[unsort_idx], p_updated)
+            
+            # Apply changes ONLY to those that were actually is_slow
+            return jax.tree.map(
+                lambda new, old: jnp.where(is_slow.reshape((-1,) + (1,) * (new.ndim - 1)), new, old),
+                p_updated_orig, p
+            )
+            
+        pop = process_slow(pop, exec_keys)
 
-        # 2. Aging Phase
-        pop = pop._replace(age=jnp.where(pop.alive, pop.age + 1, pop.age))
+        # 2. Aging Phase (Already done for fast track, do for slow track)
+        pop = pop._replace(age=jnp.where(pop.alive & is_slow, pop.age + 1, pop.age))
+
+        # Promotion Phase: If an UNCLASSIFIED genome divides, promote it.
+        just_divided_unclassified = pop.alive & pop.has_child & (pop.status == UNCLASSIFIED)
+        
+        # Verify reproduction correctness BEFORE promoting
+        child_lens = pop.child_len
+        child_len_valid = (child_lens >= (self.cfg.min_allocation_ratio * pop.genome_len)) & \
+                          (child_lens <= (self.cfg.max_allocation_ratio * pop.genome_len))
+                          
+        # It's WELL_BEHAVED only if it divides correctly without reading from child.
+        is_well = child_len_valid & ~pop.read_from_child
+        # If it divides but violates rules, it's FAILED (non-reproducible)
+        is_failed = just_divided_unclassified & ~is_well
+        
+        new_status = jnp.where(
+            just_divided_unclassified,
+            jnp.where(is_well, jnp.int32(WELL_BEHAVED), jnp.int32(POORLY_BEHAVED)),
+            pop.status
+        )
+        
+        # Also, if an organism takes too long (> 2000 cycles) to reproduce, mark it as FAILED
+        # to prevent recomputing non-reproducible codes!
+        new_status = jnp.where(
+            (new_status == UNCLASSIFIED) & (pop.age > 2000),
+            jnp.int32(FAILED),
+            new_status
+        )
+        
+        # When it becomes WELL_BEHAVED, we record its gestation_time!
+        new_gestation = jnp.where(
+            just_divided_unclassified & ~pop.read_from_child,
+            pop.age,
+            pop.gestation_time
+        )
+        
+        pop = pop._replace(status=new_status, gestation_time=new_gestation)
+
+        newly_classified_mask = just_divided_unclassified | ((new_status == FAILED) & (pop.status != FAILED))
+        jax.debug.callback(collect_genomes, pop.genome_hash, pop.genome, new_status, newly_classified_mask)
 
         # 3. Birth Phase (Mutation & Parsing)
         has_child = pop.has_child
@@ -145,8 +263,8 @@ class Model:
             v = jnp.clip(color[2] + noise[2], 0.0, 1.0)
             return jnp.array([h, s, v])
 
-        def mutate_one(mut_key, tape, tape_len, has, parent_color):
-            new_tape, new_len = Agent.apply_divide_mutations(mut_key, tape, tape_len, self.cfg)
+        def mutate_one(mut_key, tape, tape_len, has, parent_color, status):
+            new_tape, new_len = Agent.apply_divide_mutations(mut_key, tape, tape_len, status, self.cfg)
             new_color = mutate_color(mut_key, parent_color)
             tape_out = jnp.where(has, new_tape, tape)
             len_out = jnp.where(has, new_len, tape_len)
@@ -154,23 +272,47 @@ class Model:
             return tape_out, len_out, color_out
 
         mutated_tapes, mutated_lens, child_colors = jax.vmap(mutate_one)(
-            mut_keys, pop.child_tape, pop.child_tape_len, has_child, pop.color
+            mut_keys, pop.child_tape, pop.child_tape_len, has_child, pop.color, pop.status
         )
 
-        child_states = jax.vmap(Agent.init_organism, in_axes=(0, 0, 0, None))(
-            mutated_tapes, mutated_lens, child_colors, self.cfg
+        child_states = jax.vmap(Agent.init_organism, in_axes=(0, 0, 0, 0, 0, 0, None))(
+            mutated_tapes, mutated_lens, child_colors, 
+            pop.genome_hash, pop.status, pop.gestation_time,
+            self.cfg
         )
 
         # 4. Spatial Placement Phase
-        pop = self._place_children_on_grid(pop, has_child, child_states, k_place)
+        pop_new, overwritten_mask = self._place_children_on_grid(pop, has_child, child_states, k_place)
+
+        # Anyone overwritten who was UNCLASSIFIED is actually a FAILED genome!
+        # Because they died before reproducing!
+        assassinated_mask = overwritten_mask & (pop.status == UNCLASSIFIED)
+        
+        # Log these assassinated ones as FAILED natively!
+        jax.debug.callback(
+            collect_genomes, 
+            pop.genome_hash, 
+            pop.genome, 
+            jnp.full_like(pop.status, FAILED), 
+            assassinated_mask
+        )
+        
+        pop = pop_new
 
         # 5. Cleanup Phase
         blank_child = jnp.full(self.cfg.max_genome_len, BLANK, dtype=jnp.int32)
+        
+        # We must NOT clear child and child_len for WELL_BEHAVED organisms, 
+        # as they store the base_child for fast-tracking.
+        is_not_well_behaved = pop.status != WELL_BEHAVED
+        clear_mask = has_child[:, None] & is_not_well_behaved[:, None]
+        clear_len_mask = has_child & is_not_well_behaved
+        
         pop = pop._replace(
-            child=jnp.where(has_child[:, None], blank_child, pop.child),
-            child_len=jnp.where(has_child, jnp.int32(0), pop.child_len),
+            child=jnp.where(clear_mask, blank_child, pop.child),
+            child_len=jnp.where(clear_len_mask, jnp.int32(0), pop.child_len),
             child_copied=jnp.where(
-                has_child[:, None],
+                clear_mask,
                 jnp.zeros(self.cfg.max_genome_len, dtype=jnp.bool_),
                 pop.child_copied
             ),
@@ -252,11 +394,8 @@ class Model:
                 cycle_num = end
                 pop_size = int(stats['pop_size'][-1])
                 births = int(jnp.sum(stats['births']))
-                #avg_len = float(stats['avg_genome_len'][-1])
                 q_len = stats['q_genome_len'][-1]
 
-                # SS: print percentiles, not avg
-                #print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, AvgLen={avg_len:.1f}")
                 print(f"Cycle {cycle_num}: Pop={pop_size}, Births={births}, Percentiles={q_len}")
 
                 if use_wandb:
@@ -264,8 +403,6 @@ class Model:
                         "cycle": cycle_num,
                         "population/size": pop_size,
                         "population/births_interval": births,
-                        # SS: use median from percentiles: INDEX MAY CHANGE IF DIFFERENT PERCENTILES USED
-                        #"genome/avg_len": avg_len,
                         "genome/median_len": q_len[3],
                     })
 
@@ -280,17 +417,16 @@ class Model:
                     'cycle': cycle_num,
                     'pop_size': pop_size,
                     'births': births,
-                    # SS: record percentiles, not avg
-                    #'avg_len': avg_len,
                     'q_len': q_len,
                     'snapshot': snapshot
                 }
 
                 all_stats.append(chunk_rec)
+                    
         except KeyboardInterrupt:
             print("Simulation interrupted by user.")
 
         if use_wandb:
             wandb.finish()
-
-        return pop, all_stats
+            
+        return pop, all_stats, global_genomes[WELL_BEHAVED], global_genomes[POORLY_BEHAVED], global_genomes[FAILED]

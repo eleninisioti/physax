@@ -1,8 +1,9 @@
 import jax
 import jax.numpy as jnp
 from jax import random
-from physax.config import make_config, PERCENTILES
+from physax.config import make_config, PERCENTILES, UNCLASSIFIED
 from physax.model import Model
+from physax.agent import Agent
 from physax.visualization import plot_metrics, save_grid_gif, save_physis_view_gif
 # SS: print whether running on cpu or gpu
 print('device:', jax.devices()[0].platform)
@@ -13,14 +14,15 @@ if __name__ == "__main__":
 
     cfg = make_config(
         #pop_size=256,
-        pop_size=4096,
+        pop_size=4096 * 20,
         #initial_pop=1,
-        initial_pop=10,
+        initial_pop=1_000,
     )
+
 
     model = Model(cfg)
     key = random.PRNGKey(42)
-    pop, stats = model.run_simulation(
+    pop, stats, well_behaved, poorly_behaved, failed = model.run_simulation(
         key,
         #total_cycles=2000,
         total_cycles=10_000,
@@ -54,3 +56,10 @@ if __name__ == "__main__":
 
     snapshots = [s['snapshot'] for s in stats]
     save_grid_gif(snapshots, "evolution.gif", cfg)
+    
+    import numpy as np
+    np.savez("genomes_classification.npz", 
+             well_behaved=well_behaved, 
+             poorly_behaved=poorly_behaved, 
+             failed=failed)
+    print("Saved classified genomes to genomes_classification.npz!")

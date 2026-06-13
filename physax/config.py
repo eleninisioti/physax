@@ -143,6 +143,12 @@ def make_config(**kwargs) -> Config:
     return cfg
 
 
+# Caching Status
+WELL_BEHAVED = 0
+POORLY_BEHAVED = 1
+FAILED = 2
+UNCLASSIFIED = 3
+
 class OpState(NamedTuple):
     se_vals: jnp.ndarray
     child_arr: jnp.ndarray
@@ -154,6 +160,7 @@ class OpState(NamedTuple):
     has_ch: jnp.ndarray
     divide_returned: jnp.ndarray
     did_jump: jnp.ndarray
+    read_from_child: jnp.ndarray
 
 class OpArgs(NamedTuple):
     step_key: jnp.ndarray
@@ -222,7 +229,15 @@ def get_opcode_functions(cfg: Config):
     def op_load(op_input) -> OpState:
         state, args = op_input
         """Load from tape at address SE[o0] into SE[o1]."""
-        val = tape_read(state, args, se_read(state, args, cfg, args.o0))
+        addr = se_read(state, args, cfg, args.o0)
+        val = tape_read(state, args, addr)
+        
+        # Track if read from child
+        total_size = jnp.maximum(args.tape_size, 1)
+        pos = jnp.abs(addr) % total_size
+        read_child = pos >= args.genome_len
+        state = state._replace(read_from_child=state.read_from_child | read_child)
+        
         return se_write(state, args, cfg, args.o1, val)
 
     def op_store(op_input) -> OpState:
@@ -394,7 +409,15 @@ def get_opcode_functions(cfg: Config):
         state, args = op_input
         """Load from tape at (SE[o0] + SE[o1]) into SE[o2]."""
         addr = se_read(state, args, cfg, args.o0) + se_read(state, args, cfg, args.o1)
-        return se_write(state, args, cfg, args.o2, tape_read(state, args, addr))
+        val = tape_read(state, args, addr)
+
+        # Track if read from child
+        total_size = jnp.maximum(args.tape_size, 1)
+        pos = jnp.abs(addr) % total_size
+        read_child = pos >= args.genome_len
+        state = state._replace(read_from_child=state.read_from_child | read_child)
+
+        return se_write(state, args, cfg, args.o2, val)
 
     def op_rel_store(op_input) -> OpState:
         state, args = op_input

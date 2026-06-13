@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
-from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, OpState, OpArgs, get_opcode_functions, tape_read
+from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, OpState, OpArgs, get_opcode_functions, tape_read, FAILED, WELL_BEHAVED, POORLY_BEHAVED, UNCLASSIFIED
 from physax.agent import Agent
 
 
@@ -16,7 +16,7 @@ class VirtualMachine:
     def update(self, agent: Agent, key) -> Agent:
         """Execute steps_per_update compound instructions on one organism."""
         def step_fn(current_agent: Agent, step_key):
-            should_exec = current_agent.alive & ~current_agent.has_child
+            should_exec = current_agent.can_execute
             new_agent = self.execute_one(current_agent, step_key)
             # Only apply if should execute
             result = jax.tree.map(
@@ -97,14 +97,26 @@ class VirtualMachine:
                 tape_read_args = ctx_args._replace(ip_for_overflow=ip_ov)
                 tape_val = tape_read(ctx_state, tape_read_args, ip_ov)
                 
+                # Track if read from child tape
+                total_size = jnp.maximum(ctx_args.tape_size, 1)
+                read_child = (jnp.abs(ip_ov) % total_size) >= ctx_args.genome_len
+                read_child_actual = ~from_instr & read_child
+                
                 val = jnp.where(from_instr, instr_val, tape_val)
                 # Advance IP only when reading from tape
                 new_ip = jnp.where(from_instr, ip_ov, ip_ov + 1)
-                return val, new_ip
+                return val, new_ip, read_child_actual
 
-            op0, ip_ov1 = read_operand(jnp.int32(0), ctx_args.ip_for_overflow)
-            op1, ip_ov2 = read_operand(jnp.int32(1), ip_ov1)
-            op2, ip_ov3 = read_operand(jnp.int32(2), ip_ov2)
+            op0, ip_ov1, rc0 = read_operand(jnp.int32(0), ctx_args.ip_for_overflow)
+            op1, ip_ov2, rc1 = read_operand(jnp.int32(1), ip_ov1)
+            op2, ip_ov3, rc2 = read_operand(jnp.int32(2), ip_ov2)
+
+            # Combine read child actual based on n_ops
+            any_read_child = jnp.where(n_ops >= 3, rc0 | rc1 | rc2,
+                                jnp.where(n_ops >= 2, rc0 | rc1,
+                                 jnp.where(n_ops >= 1, rc0, False)))
+            
+            ctx_state = ctx_state._replace(read_from_child=ctx_state.read_from_child | any_read_child)
 
             # Select appropriate IP based on actual n_ops
             ip_after_ops = jnp.where(
@@ -158,7 +170,8 @@ class VirtualMachine:
             gest_time=agent.gestation_time,
             has_ch=agent.has_child,
             divide_returned=jnp.bool_(False),
-            did_jump=jnp.bool_(False)
+            did_jump=jnp.bool_(False),
+            read_from_child=jnp.bool_(False)
         )
         
         init_args = OpArgs(

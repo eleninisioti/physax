@@ -5,3 +5,6 @@ uv.lock
 *.png
 *.txt
 __pycache__
+*.npz
+*.log
+.DS_Store

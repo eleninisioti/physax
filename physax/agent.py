@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
 from typing import NamedTuple
-from physax.config import Config, N_OPERANDS, UP_IS_SIZE, BLANK, I, SEP, R, S, Q, B, MOVE, NOP, CLEAR, INC, CINC, LOAD, IS_SEP, IFZERO, JUMP, ALLOCATE, REL_STORE, DEC, IFNOTZERO, DIVIDE
+from physax.config import Config, N_OPERANDS, UP_IS_SIZE, BLANK, I, SEP, R, S, Q, B, MOVE, NOP, CLEAR, INC, CINC, LOAD, IS_SEP, IFZERO, JUMP, ALLOCATE, REL_STORE, DEC, IFNOTZERO, DIVIDE, UNCLASSIFIED, WELL_BEHAVED, POORLY_BEHAVED, FAILED
 
 class Agent(NamedTuple):
     """Immutable state representation of a single organism."""
@@ -29,6 +29,9 @@ class Agent(NamedTuple):
     executed: jnp.ndarray
     color: jnp.ndarray
     child_color: jnp.ndarray
+    read_from_child: jnp.ndarray
+    status: jnp.ndarray
+    genome_hash: jnp.ndarray
 
     @property
     def can_execute(self) -> jnp.ndarray:
@@ -73,6 +76,10 @@ class Agent(NamedTuple):
             # Visualization
             color=jnp.zeros(3, dtype=jnp.float32),
             child_color=jnp.zeros(3, dtype=jnp.float32),
+            # Caching
+            read_from_child=jnp.bool_(False),
+            status=jnp.int32(UNCLASSIFIED),
+            genome_hash=jnp.int32(0),
         )
 
     @staticmethod
@@ -107,7 +114,7 @@ class Agent(NamedTuple):
         return genome, genome_len
 
     @classmethod
-    def init_organism(cls, genome, genome_len, color, cfg: Config) -> "Agent":
+    def init_organism(cls, genome, genome_len, color, parent_hash, parent_status, parent_gestation, cfg: Config) -> "Agent":
         """Initialize a new living organism from a genome. 
         Parses the structure and instructions automatically."""
         parsed = cls._parse_genome(genome, genome_len, cfg)
@@ -115,19 +122,52 @@ class Agent(NamedTuple):
         # IP starts right after separator
         ip_start = (parsed['separator_pos'] + 1) % jnp.maximum(genome_len, 1)
         
+        hash_val = cls._hash_genome(genome, genome_len, cfg)
+        
+        # Color agents based on genome hash
+        h = (jnp.float32(hash_val) * 0.618033988749895) % 1.0
+        s = jnp.float32(0.8)
+        v = jnp.float32(1.0)
+        derived_color = jnp.array([h, s, v])
+        
         state = cls.create_empty(cfg)
         return state._replace(
             genome=genome,
             genome_len=genome_len,
-            color=color,
+            color=derived_color,
             alive=jnp.bool_(True),
             n_ses=parsed['n_ses'],
             separator_pos=parsed['separator_pos'],
             n_instructions=parsed['n_instructions'],
             instruction_table=parsed['instruction_table'],
             instruction_lengths=parsed['instruction_lengths'],
-            se_values=state.se_values.at[0].set(ip_start)
+            se_values=state.se_values.at[0].set(ip_start),
+            genome_hash=hash_val,
+            status=jnp.where(hash_val == parent_hash, parent_status, state.status),
+            gestation_time=jnp.where(hash_val == parent_hash, parent_gestation, state.gestation_time),
+            child=jnp.where(hash_val == parent_hash, genome, state.child),
+            child_len=jnp.where(hash_val == parent_hash, genome_len, state.child_len),
+            child_copied=jnp.where(
+                hash_val == parent_hash, 
+                jnp.arange(cfg.max_genome_len) < genome_len, 
+                state.child_copied
+            )
         )
+
+    @classmethod
+    def _hash_genome(cls, genome, genome_len, cfg: Config):
+        # Simple polynomial rolling hash for genome
+        # Use prime 31 and modulo 2^63-1
+        positions = jnp.arange(cfg.max_genome_len)
+        valid = positions < genome_len
+        
+        def hash_step(h, i):
+            val = jnp.where(valid[i], genome[i], jnp.int32(0))
+            new_h = (h * jnp.int32(31) + val) % jnp.int32(2147483647)
+            return new_h, None
+            
+        h_final, _ = lax.scan(hash_step, jnp.int32(0), positions)
+        return h_final
 
     @classmethod
     def _parse_genome(cls, genome, genome_len, cfg: Config):
@@ -258,13 +298,21 @@ class Agent(NamedTuple):
         return instruction_table, instruction_lengths, n_instructions
 
     @staticmethod
-    def apply_divide_mutations(key, child_tape, child_tape_len, cfg: Config):
+    def apply_divide_mutations(key, child_tape, child_tape_len, status, cfg: Config):
         """Apply divide mutations to child tape after successful divide.
         Order: point mutation, insertion, deletion (matching CellGeneticCodeTape.divide()).
+        Also applies deferred copy_mutation if status is WELL_BEHAVED.
         """
-        k1, k2, k3, k4, k5, k6, k7, k8 = random.split(key, 8)
+        k_copy_1, k_copy_2, k1, k2, k3, k4, k5, k6, k7 = random.split(key, 9)
 
-        # Point mutation
+        # 0. Deferred copy mutation (only for WELL_BEHAVED)
+        is_well_behaved = status == WELL_BEHAVED
+        do_copy = random.uniform(k_copy_1, (cfg.max_genome_len,)) < cfg.copy_mutation_rate
+        copy_vals = random.randint(k_copy_2, (cfg.max_genome_len,), 0, UP_IS_SIZE).astype(jnp.int32)
+        valid_mask = jnp.arange(cfg.max_genome_len) < child_tape_len
+        child_tape = jnp.where(is_well_behaved & do_copy & valid_mask, copy_vals, child_tape)
+
+        # 1. Point mutation
         do_point = random.uniform(k1) < cfg.divide_mutation_rate
         point_pos = random.randint(k2, (), 0, jnp.maximum(child_tape_len, 1))
         point_val = random.randint(k3, (), 0, UP_IS_SIZE).astype(jnp.int32)
