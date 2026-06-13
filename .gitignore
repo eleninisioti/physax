@@ -4,3 +4,4 @@ uv.lock
 *.gif
 *.png
 *.txt
+__pycache__

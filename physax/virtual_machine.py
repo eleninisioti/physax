@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
-from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, VMContext, get_opcode_functions, tape_read
+from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, OpState, OpArgs, get_opcode_functions, tape_read
 from physax.agent import Agent
 
 
@@ -63,17 +63,18 @@ class VirtualMachine:
         # Pre-split keys for all micro-op steps
         step_keys = random.split(key, self.cfg.max_micro_ops + 1)
 
-        def micro_op_step(ctx: VMContext, step_idx):
+        def micro_op_step(ctx_tuple, step_idx):
+            ctx_state, ctx_args = ctx_tuple
             step_key = step_keys[step_idx]
             # Are we at a valid position?
-            at_valid = (ctx.pos_in_instr < instr_len) & ~ctx.divide_returned
+            at_valid = (ctx_args.pos_in_instr < instr_len) & ~ctx_state.divide_returned
 
             # Read current value from instruction
-            safe_pos = jnp.clip(ctx.pos_in_instr, 0, self.cfg.max_micro_ops - 1)
+            safe_pos = jnp.clip(ctx_args.pos_in_instr, 0, self.cfg.max_micro_ops - 1)
             cur_val = instr[safe_pos]
 
             # Is this position an opcode?
-            is_opcode = (ctx.pos_in_instr == ctx.next_opcode_pos) & at_valid
+            is_opcode = (ctx_args.pos_in_instr == ctx_args.next_opcode_pos) & at_valid
             # Get opcode (already normalized during parsing)
             opcode = jnp.where(is_opcode, cur_val, NOP)
             safe_opcode = jnp.clip(opcode, 0, UP_IS_SIZE - 1)
@@ -82,7 +83,7 @@ class VirtualMachine:
 
             # fillOperands: read n_ops operands starting from pos_in_instr+1
             # If not enough in instruction, fetch from tape (parent) and advance ip
-            ops_start = ctx.pos_in_instr + 1
+            ops_start = ctx_args.pos_in_instr + 1
             remaining_in_instr = jnp.maximum(instr_len - ops_start, 0)
 
             # Read up to 3 operands
@@ -91,13 +92,17 @@ class VirtualMachine:
                 from_instr = op_idx < remaining_in_instr
                 safe_ipos = jnp.clip(instr_pos, 0, self.cfg.max_micro_ops - 1)
                 instr_val = instr[safe_ipos]
-                tape_val = tape_read(ctx._replace(ip_for_overflow=ip_ov), ip_ov)
+                
+                # Create mini args for tape_read overflow fetch
+                tape_read_args = ctx_args._replace(ip_for_overflow=ip_ov)
+                tape_val = tape_read(ctx_state, tape_read_args, ip_ov)
+                
                 val = jnp.where(from_instr, instr_val, tape_val)
                 # Advance IP only when reading from tape
                 new_ip = jnp.where(from_instr, ip_ov, ip_ov + 1)
                 return val, new_ip
 
-            op0, ip_ov1 = read_operand(jnp.int32(0), ctx.ip_for_overflow)
+            op0, ip_ov1 = read_operand(jnp.int32(0), ctx_args.ip_for_overflow)
             op1, ip_ov2 = read_operand(jnp.int32(1), ip_ov1)
             op2, ip_ov3 = read_operand(jnp.int32(2), ip_ov2)
 
@@ -105,15 +110,15 @@ class VirtualMachine:
             ip_after_ops = jnp.where(
                 n_ops >= 3, ip_ov3, 
                 jnp.where(n_ops >= 2, ip_ov2, 
-                          jnp.where(n_ops >= 1, ip_ov1, ctx.ip_for_overflow))
+                          jnp.where(n_ops >= 1, ip_ov1, ctx_args.ip_for_overflow))
             )
 
             # Normalize operands: abs(val) % Short.MAX_VALUE, then % n_ses for SE indexing
             def norm_op(val):
                 v = jnp.where(val < 0, -val, val) % 32767
-                return v % jnp.maximum(ctx.n_ses, 1)
+                return v % jnp.maximum(ctx_args.n_ses, 1)
 
-            ctx = ctx._replace(
+            ctx_args = ctx_args._replace(
                 step_key=step_key,
                 o0=norm_op(op0),
                 o1=norm_op(op1),
@@ -122,69 +127,75 @@ class VirtualMachine:
 
             # lax.switch evaluates only the branch matching `safe_opcode`
             # ---- Execute opcode ----
-            new_ctx = lax.switch(safe_opcode, self.opcode_functions, ctx)
+            new_state = lax.switch(safe_opcode, self.opcode_functions, (ctx_state, ctx_args))
 
-            # If it wasn't an opcode position, we revert the context (NO-OP)
-            new_ctx = jax.tree.map(lambda n, o: jnp.where(is_opcode, n, o), new_ctx, ctx)
+            # If it wasn't an opcode position, we revert the state (NO-OP)
+            new_state = jax.tree.map(lambda n, o: jnp.where(is_opcode, n, o), new_state, ctx_state)
 
             # Advance counts and positions
             ops_consumed_from_instr = jnp.minimum(n_ops, remaining_in_instr)
-            new_pos = jnp.where(is_opcode, ctx.pos_in_instr + 1 + ops_consumed_from_instr, ctx.pos_in_instr)
+            new_pos = jnp.where(is_opcode, ctx_args.pos_in_instr + 1 + ops_consumed_from_instr, ctx_args.pos_in_instr)
 
-            return new_ctx._replace(
-                cntr=jnp.where(is_opcode, ctx.cntr + 1, ctx.cntr),
+            new_args = ctx_args._replace(
+                cntr=jnp.where(is_opcode, ctx_args.cntr + 1, ctx_args.cntr),
                 pos_in_instr=new_pos,
-                next_opcode_pos=jnp.where(is_opcode, new_pos, ctx.next_opcode_pos),
-                ip_for_overflow=jnp.where(is_opcode, ip_after_ops, ctx.ip_for_overflow)
-            ), None
+                next_opcode_pos=jnp.where(is_opcode, new_pos, ctx_args.next_opcode_pos),
+                ip_for_overflow=jnp.where(is_opcode, ip_after_ops, ctx_args.ip_for_overflow)
+            )
+
+            return (new_state, new_args), None
+
 
         tape_sz = agent.genome_len + jnp.where(agent.already_allocated, agent.child_len, 0)
         
-        init_ctx = VMContext(
+        init_state = OpState(
             se_vals=agent.se_values,
             child_arr=agent.child,
             child_cop=agent.child_copied,
             genome_arr=agent.genome,
             already_alloc=agent.already_allocated,
             child_l=agent.child_len,
-            ip_for_overflow=ip_val,
-            pos_in_instr=jnp.int32(0),
-            next_opcode_pos=jnp.int32(0),
-            divide_returned=jnp.bool_(False),
-            cntr=agent.counter,
             gest_time=agent.gestation_time,
             has_ch=agent.has_child,
-            did_jump=jnp.bool_(False),
+            divide_returned=jnp.bool_(False),
+            did_jump=jnp.bool_(False)
+        )
+        
+        init_args = OpArgs(
             step_key=step_keys[0],
             genome_len=agent.genome_len,
             n_ses=agent.n_ses,
             tape_size=tape_sz,
+            cntr=agent.counter,
             o0=jnp.int32(0),
             o1=jnp.int32(0),
-            o2=jnp.int32(0)
+            o2=jnp.int32(0),
+            pos_in_instr=jnp.int32(0),
+            next_opcode_pos=jnp.int32(0),
+            ip_for_overflow=ip_val
         )
 
-        final_ctx, _ = lax.scan(micro_op_step, init_ctx, jnp.arange(self.cfg.max_micro_ops))
+        (final_state, final_args), _ = lax.scan(micro_op_step, (init_state, init_args), jnp.arange(self.cfg.max_micro_ops))
 
-        new_ip = final_ctx.se_vals[0] + 1
-        new_ip = jnp.where(final_ctx.divide_returned, final_ctx.se_vals[0], new_ip)
+        new_ip = final_state.se_vals[0] + 1
+        new_ip = jnp.where(final_state.divide_returned, final_state.se_vals[0], new_ip)
 
-        do_divide_success = final_ctx.has_ch & ~agent.has_child
+        do_divide_success = final_state.has_ch & ~agent.has_child
         restart_ip = (agent.separator_pos + 1) % jnp.maximum(agent.genome_len, 1)
         new_ip = jnp.where(do_divide_success, restart_ip, new_ip)
-        final_counter = jnp.where(do_divide_success, jnp.int32(0), final_ctx.cntr)
+        final_counter = jnp.where(do_divide_success, jnp.int32(0), final_args.cntr)
 
-        final_se_vals = final_ctx.se_vals.at[0].set(new_ip)
+        final_se_vals = final_state.se_vals.at[0].set(new_ip)
 
         return agent._replace(
             se_values=final_se_vals,
-            child=final_ctx.child_arr,
-            child_len=final_ctx.child_l,
-            child_copied=final_ctx.child_cop,
-            already_allocated=final_ctx.already_alloc,
-            genome=final_ctx.genome_arr,
-            has_child=final_ctx.has_ch,
+            child=final_state.child_arr,
+            child_len=final_state.child_l,
+            child_copied=final_state.child_cop,
+            already_allocated=final_state.already_alloc,
+            genome=final_state.genome_arr,
+            has_child=final_state.has_ch,
             counter=final_counter,
-            gestation_time=final_ctx.gest_time,
+            gestation_time=final_state.gest_time,
             executed=executed
         )
