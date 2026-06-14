@@ -24,5 +24,6 @@ CUDA_VISIBLE_DEVICES=2 python -m physax --pop_size 16384 --initial_pop 50 --tota
 
 CUDA_VISIBLE_DEVICES=0 python -m physax --toy
 
+# re-run visualization of the run (pass folder name, base path should be in the .env file):
 python -m physax.visualization --folder run_2026-06-14_12-22-49_300cycles
 ```

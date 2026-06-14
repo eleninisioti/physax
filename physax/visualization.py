@@ -263,7 +263,7 @@ def save_custom_3panel_gif(snapshots, filename, cfg):
 
     frames = []
     
-    for pi, snap in enumerate(snapshots):
+    for pi, snap in enumerate(snapshots):  # [::2]
         alive = snap.get('alive', np.array([]))
         if len(alive) == 0:
             continue
@@ -365,6 +365,130 @@ def save_custom_3panel_gif(snapshots, filename, cfg):
     imageio.mimsave(filename, frames, fps=10)
     print(f"Saved custom 3-panel GIF to {filename}")
 
+def plot_gestation_and_diversity(stats, filename="gestation_diversity.png"):
+    """
+    Plot the average gestation period and diversity of self-replicating/fertile agents over time.
+    """
+    from physax.config import UNCLASSIFIED, NON_FERTILE, SELF_REPLICATING, FERTILE
+    
+    cycles = []
+    
+    # Self-Replicating stats
+    avg_gest_self_rep = []
+    shannon_div_self_rep = []
+    total_self_rep = []
+    unique_self_rep = []
+    
+    # Fertile stats
+    avg_gest_fertile = []
+    shannon_div_fertile = []
+    total_fertile = []
+    unique_fertile = []
+    
+    for chunk in stats:
+        cycle = chunk['cycle']
+        snap = chunk['snapshot']
+        
+        alive = snap['alive']
+        status = snap['status']
+        gest_times = snap['gestation_time']
+        hashes = snap['hash']
+        
+        cycles.append(cycle)
+        
+        # Self-replicating and Fertile masks
+        mask_sr = alive & (status == SELF_REPLICATING)
+        mask_f = alive & (status == FERTILE)
+        
+        # --- Self-Replicating Calculations ---
+        if np.any(mask_sr):
+            gests_sr = gest_times[mask_sr]
+            gests_sr = gests_sr[gests_sr < 2000000000]
+            avg_gest_self_rep.append(np.mean(gests_sr) if len(gests_sr) > 0 else np.nan)
+            
+            hashes_sr = hashes[mask_sr]
+            uniq_sr, counts_sr = np.unique(hashes_sr, return_counts=True)
+            total_self_rep.append(np.sum(mask_sr))
+            unique_self_rep.append(len(uniq_sr))
+            
+            probs_sr = counts_sr / np.sum(counts_sr)
+            shannon_div_self_rep.append(-np.sum(probs_sr * np.log(probs_sr)))
+        else:
+            avg_gest_self_rep.append(np.nan)
+            total_self_rep.append(0)
+            unique_self_rep.append(0)
+            shannon_div_self_rep.append(0.0)
+            
+        # --- Fertile Calculations ---
+        if np.any(mask_f):
+            gests_f = gest_times[mask_f]
+            gests_f = gests_f[gests_f < 2000000000]
+            avg_gest_fertile.append(np.mean(gests_f) if len(gests_f) > 0 else np.nan)
+            
+            hashes_f = hashes[mask_f]
+            uniq_f, counts_f = np.unique(hashes_f, return_counts=True)
+            total_fertile.append(np.sum(mask_f))
+            unique_fertile.append(len(uniq_f))
+            
+            probs_f = counts_f / np.sum(counts_f)
+            shannon_div_fertile.append(-np.sum(probs_f * np.log(probs_f)))
+        else:
+            avg_gest_fertile.append(np.nan)
+            total_fertile.append(0)
+            unique_fertile.append(0)
+            shannon_div_fertile.append(0.0)
+            
+    if not cycles:
+        print("No replicating agents found to plot gestation and diversity.")
+        return
+        
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    
+    # --- Top Panel: Gestation & Shannon Diversity ---
+    color_sr = '#2ca02c' # Green for Self-Replicating (aligns with GIF category color)
+    color_f = '#1f77b4' # Blue for Fertile (aligns with GIF category color)
+    
+    # Left Y-axis: Gestation Time
+    ax1.set_ylabel('Average Gestation Time (cycles)', fontsize=12)
+    l1 = ax1.plot(cycles, avg_gest_self_rep, color=color_sr, lw=2, label='Self-Replicating')
+    l2 = ax1.plot(cycles, avg_gest_fertile, color=color_f, lw=2, label='Fertile (but not self-replicating)')
+    ax1.tick_params(axis='y')
+    ax1.grid(True, alpha=0.3)
+    
+    # # Right Y-axis: Diversity
+    # ax2 = ax1.twinx()
+    # ax2.set_ylabel('Diversity (Shannon Entropy)', color='#555555', fontsize=12)
+    # l3 = ax2.plot(cycles, shannon_div_self_rep, color=color_sr, lw=1.5, linestyle='--', label='Self-Replicating (Diversity)')
+    # l4 = ax2.plot(cycles, shannon_div_fertile, color=color_f, lw=1.5, linestyle='--', label='Fertile (Diversity)')
+    # ax2.tick_params(axis='y', labelcolor='#555555')
+    
+    # Combine legends from both axes
+    lines = l1 + l2 #+ l3 + l4
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    
+    ax1.set_title('Average Gestation Time and Genome Diversity Over Time', fontsize=14, pad=10)
+    
+    # --- Bottom Panel: Replicator Counts (Total vs. Unique) ---
+    ax3.plot(cycles, total_self_rep, color=color_sr, lw=2, label='Total Self-Replicating')
+    ax3.plot(cycles, unique_self_rep, color=color_sr, lw=1.5, linestyle='-.', label='Unique Self-Replicating (Genomes)')
+    
+    ax3.plot(cycles, total_fertile, color=color_f, lw=2, label='Total Fertile')
+    ax3.plot(cycles, unique_fertile, color=color_f, lw=1.5, linestyle='-.', label='Unique Fertile (Genomes)')
+    
+    ax3.set_xlabel('Cycle', fontsize=12)
+    ax3.set_ylabel('Agent Count', fontsize=12)
+    ax3.tick_params(axis='y')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc='upper left')
+    
+    ax3.set_title('Total vs. Unique Replicators by Category', fontsize=14, pad=10)
+    
+    fig.tight_layout()
+    plt.savefig(filename, dpi=300)
+    plt.close()
+    print(f"Saved gestation, diversity and counts plot to {filename}")
+
 def generate_all_visualizations(stats, output_dir, cfg=None):
     from pathlib import Path
     from physax.genome_analysis import analyze_and_plot_top_genomes
@@ -387,8 +511,11 @@ def generate_all_visualizations(stats, output_dir, cfg=None):
         inferred_pop_size = len(snapshots[-1]['alive'])
         cfg = make_config(pop_size=inferred_pop_size)
         
-    # save_grid_gif(snapshots, str(path / "evolution.gif"), cfg)
+    # # save_grid_gif(snapshots, str(path / "evolution.gif"), cfg)
     save_custom_3panel_gif(snapshots, str(path / "evolution_3panel.gif"), cfg)
+    
+    # Plot gestation and diversity over time
+    plot_gestation_and_diversity(stats, str(path / "gestation_diversity.png"))
     
     # Analyze and plot top genomes
     top_hashes = analyze_and_plot_top_genomes(stats, str(path / "top_genomes.png"))

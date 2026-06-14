@@ -95,7 +95,7 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
         hashes = snap['hash']
         gest_times = snap['gestation_time']
         
-        alive_self_rep_mask = alive & (status == SELF_REPLICATING)
+        alive_self_rep_mask = alive & (status != UNCLASSIFIED) & (status != NON_FERTILE)
         valid_hashes = hashes[alive_self_rep_mask]
         valid_gest = gest_times[alive_self_rep_mask]
         
@@ -123,8 +123,9 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
         print("No self-replicating genomes found to plot.")
         return
 
+    top_n = 10
     # Find top 10 most frequent hashes
-    top_10 = sorted(cumulative_copies.items(), key=lambda x: x[1], reverse=True)[:10]
+    top_10 = sorted(cumulative_copies.items(), key=lambda x: x[1], reverse=True)[:top_n]
     
     plt.figure(figsize=(12, 8))
     for h, _ in top_10:
@@ -134,12 +135,12 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
         
     plt.xlabel("Cycle")
     plt.ylabel("Population Count")
-    plt.title("Top 10 Self-Replicating Genomes Over Time")
+    plt.title(f"Top {top_n} Self-Replicating Genomes Over Time")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(filename)
     plt.close()
-    print(f"Saved top genomes plot to {filename}")
+    print(f"Saved top {top_n} genomes plot to {filename}")
     
     return [h for h, _ in top_10]

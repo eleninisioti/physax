@@ -17,6 +17,7 @@ if __name__ == "__main__":
     parser.add_argument('--total_cycles', type=int, default=50_000)
     parser.add_argument('--log_interval', type=int, default=50)
     parser.add_argument('--toy', action='store_true', help='Run a very small toy scenario for debugging')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for the simulation')
     args = parser.parse_args()
 
     if args.toy:
@@ -50,12 +51,12 @@ if __name__ == "__main__":
                     break
         
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    path = base_path / f"run_{args.total_cycles}_cycles_{timestamp}"
+    path = base_path / f"run_{args.total_cycles}_cycles_seed_{args.seed}_{timestamp}"
     path.mkdir(parents=True, exist_ok=True)
     print(f"\nSaving results to: {path}")
 
     model = Model(cfg)
-    key = random.PRNGKey(42)
+    key = random.PRNGKey(args.seed)
     try:
         pop, stats = model.run_simulation(
             key,
@@ -83,14 +84,11 @@ if __name__ == "__main__":
         from physax.model import global_self_replicating_genomes
         import numpy as np
         
-        top_genomes_dict = {}
-        for h in top_hashes:
-            if h in global_self_replicating_genomes:
-                top_genomes_dict[str(h)] = global_self_replicating_genomes[h]
+        all_genomes_dict = {str(h): g for h, g in global_self_replicating_genomes.items()}
                 
-        if top_genomes_dict:
-            np.savez(str(path / "genomes_details.npz"), **top_genomes_dict)
-            print("Saved top genomes to genomes_details.npz")
+        if all_genomes_dict:
+            np.savez(str(path / "genomes_details.npz"), **all_genomes_dict)
+            print(f"Saved {len(all_genomes_dict)} self-replicating genomes to genomes_details.npz")
     else:
         print("No stats collected, skipping plots and saves.")
     
