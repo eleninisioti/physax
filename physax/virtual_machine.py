@@ -168,6 +168,7 @@ class VirtualMachine:
             already_alloc=agent.already_allocated,
             child_l=agent.child_len,
             gest_time=agent.gestation_time,
+            exec_inst=agent.executed_instructions,
             has_ch=agent.has_child,
             divide_returned=jnp.bool_(False),
             did_jump=jnp.bool_(False),
@@ -210,5 +211,6 @@ class VirtualMachine:
             has_child=final_state.has_ch,
             counter=final_counter,
             gestation_time=final_state.gest_time,
+            executed_instructions=final_state.exec_inst,
             executed=executed
         )

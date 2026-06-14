@@ -19,6 +19,10 @@ This will create a virtual environment, activate it, and install all dependencie
 
 ```bash
 
-CUDA_VISIBLE_DEVICES=2 python -m physax --pop_size 16384 --initial_pop 1000 --total_cycles 3000 --log_interval 50
+CUDA_VISIBLE_DEVICES=2 python -m physax --pop_size 65536 --initial_pop 1000 --total_cycles 6000 --log_interval 50
+CUDA_VISIBLE_DEVICES=2 python -m physax --pop_size 16384 --initial_pop 50 --total_cycles 6000 --log_interval 50
 
+CUDA_VISIBLE_DEVICES=0 python -m physax --toy
+
+python -m physax.visualization --folder run_2026-06-14_12-22-49_300cycles
 ```

@@ -24,6 +24,7 @@ class Agent(NamedTuple):
     has_child: jnp.ndarray
     counter: jnp.ndarray
     gestation_time: jnp.ndarray
+    executed_instructions: jnp.ndarray
     child_tape: jnp.ndarray
     child_tape_len: jnp.ndarray
     executed: jnp.ndarray
@@ -66,6 +67,7 @@ class Agent(NamedTuple):
             has_child=jnp.bool_(False),
             counter=jnp.int32(0),
             gestation_time=jnp.int32(2147483647),
+            executed_instructions=jnp.int32(0),
             # Child tape for placement after divide
             child_tape=jnp.full(cfg.max_genome_len, BLANK, dtype=jnp.int32),
             child_tape_len=jnp.int32(0),
@@ -133,6 +135,7 @@ class Agent(NamedTuple):
             genome_hash=hash_val,
             status=jnp.where(hash_val == parent_hash, parent_status, state.status),
             gestation_time=jnp.where(hash_val == parent_hash, parent_gestation, state.gestation_time),
+            executed_instructions=jnp.where(hash_val == parent_hash, jnp.int32(0), state.executed_instructions),
             child=jnp.where(hash_val == parent_hash, genome, state.child),
             child_len=jnp.where(hash_val == parent_hash, genome_len, state.child_len),
             child_copied=jnp.where(

@@ -258,8 +258,8 @@ def save_custom_3panel_gif(snapshots, filename, cfg):
     #         valid_gest = valid_gest[valid_gest < 2000000000]
     #         if len(valid_gest) > 0:
     #             max_gestation = max(max_gestation, float(np.max(valid_gest)))
-    # Use fixed max gestation of 21 cycles
-    max_gestation = 21.0
+    # Use fixed max gestation
+    max_gestation = 21.0 + 10
 
     frames = []
     
@@ -285,33 +285,37 @@ def save_custom_3panel_gif(snapshots, filename, cfg):
         
         grid_hash = np.pad(rgb_hash, ((0, pad_size), (0, 0)), constant_values=0.0).reshape(grid_side, grid_side, 3)
         ax_hash.imshow(grid_hash, interpolation='nearest', aspect='equal')
-        ax_hash.set_title("Unique Genome Hash")
+        ax_hash.set_title("Unique Genomes")
         ax_hash.axis('off')
         
         # Panel 2: Gestation Time
         ax_gest = axes[1]
         gest = snap.get('gestation_time', np.zeros_like(alive, dtype=float)).copy()
         
-        cmap_gest = plt.get_cmap('plasma')
-        gest_mask = (gest < 2000000000) & alive
-        normed_gest = np.zeros_like(gest)
-        # Normalize between 1 and max_gestation
-        normed_gest[gest_mask] = np.clip((gest[gest_mask] - 1) / (max_gestation - 1), 0, 1)
+        status = snap.get('status', np.zeros_like(alive, dtype=int))
         
-        rgba_gest = cmap_gest(normed_gest)
+        cmap_gest = plt.get_cmap('plasma')
+        
+        sm_gest = plt.cm.ScalarMappable(cmap=cmap_gest, norm=plt.Normalize(vmin=0, vmax=max_gestation))
+        
+        # Clip gestation values between 0 and max_gestation
+        clipped_gest = np.clip(gest, 0, max_gestation)
+        rgba_gest = sm_gest.to_rgba(clipped_gest)
         rgb_gest = rgba_gest[..., :3]
         
-        not_reproduced = (gest >= 2000000000) & alive
-        rgb_gest[not_reproduced] = [0.25, 0.25, 0.25] # grey
+        # Show gestation time only for SELF_REPLICATING (1), FERTILE (2), and NON_STANDARD (4)
+        show_gest = ((status == 1) | (status == 2) | (status == 4)) & alive
+        hide_gest = (~show_gest) & alive
+        
+        rgb_gest[hide_gest] = [0.25, 0.25, 0.25] # grey
         rgb_gest[dead_mask] = [0.0, 0.0, 0.0]
         
         grid_gest = np.pad(rgb_gest, ((0, pad_size), (0, 0)), constant_values=0.0).reshape(grid_side, grid_side, 3)
         im_gest = ax_gest.imshow(grid_gest, interpolation='nearest', aspect='equal')
-        ax_gest.set_title("Time to Reproduce")
+        ax_gest.set_title("Gestation Time (cycles)\nSeed Ancestor GT=21")
         ax_gest.axis('off')
         
         # Add colorbar for gestation
-        sm_gest = plt.cm.ScalarMappable(cmap=cmap_gest, norm=plt.Normalize(vmin=1, vmax=max_gestation))
         sm_gest.set_array([])
         cb_gest = fig.colorbar(sm_gest, ax=ax_gest, fraction=0.046, pad=0.04, format='%d')
         cb_gest.set_label("Cycles", size=16)
@@ -360,3 +364,79 @@ def save_custom_3panel_gif(snapshots, filename, cfg):
 
     imageio.mimsave(filename, frames, fps=10)
     print(f"Saved custom 3-panel GIF to {filename}")
+
+def generate_all_visualizations(stats, output_dir, cfg=None):
+    from pathlib import Path
+    from physax.genome_analysis import analyze_and_plot_top_genomes
+    from physax.config import make_config
+    
+    path = Path(output_dir)
+    if not path.exists():
+        path.mkdir(parents=True)
+        
+    timestamps = [s['cycle'] for s in stats]
+    pop_sizes = [s['pop_size'] for s in stats]
+    births = [s['births'] for s in stats]
+    q_lens = [s['q_len'] for s in stats]
+
+    plot_metrics(timestamps, pop_sizes, births, q_lens, str(path / "simulation_metrics.png"))
+
+    snapshots = [s['snapshot'] for s in stats]
+    
+    if cfg is None:
+        inferred_pop_size = len(snapshots[-1]['alive'])
+        cfg = make_config(pop_size=inferred_pop_size)
+        
+    # save_grid_gif(snapshots, str(path / "evolution.gif"), cfg)
+    save_custom_3panel_gif(snapshots, str(path / "evolution_3panel.gif"), cfg)
+    
+    # Analyze and plot top genomes
+    top_hashes = analyze_and_plot_top_genomes(stats, str(path / "top_genomes.png"))
+    return top_hashes
+
+if __name__ == "__main__":
+    import argparse
+    import pickle
+    from pathlib import Path
+    
+    parser = argparse.ArgumentParser(description="Generate visualizations from a simulation run directory.")
+    parser.add_argument("--folder", type=str, default=None, help="Folder name inside the base path")
+    args = parser.parse_args()
+    
+    import os
+    base_path = Path("output")
+    env_file = Path(".env")
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                if line.startswith("BASE_PATH="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    base_path = Path(val)
+                    break
+
+    if args.folder:
+        folder_path = base_path / args.folder
+    else:
+        runs = list(base_path.glob("run_*"))
+        if not runs:
+            print(f"Error: No run folders found in {base_path}")
+            exit(1)
+            
+        folder_path = max(runs, key=os.path.getmtime)
+        print(f"Auto-selected most recent run: {folder_path}")
+    stats_file = folder_path / "simulation_stats.pkl"
+    
+    if not stats_file.exists():
+        print(f"Error: Could not find {stats_file}")
+        exit(1)
+        
+    print(f"Loading stats from {stats_file}...")
+    with open(stats_file, "rb") as f:
+        stats = pickle.load(f)
+        
+    if len(stats) == 0:
+        print("Error: Stats file is empty.")
+        exit(1)
+        
+    generate_all_visualizations(stats, folder_path)
+    print("All visualizations generated successfully.")

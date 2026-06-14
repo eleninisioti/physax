@@ -227,9 +227,10 @@ class Model:
 
         # Stats
         stats = compute_cycle_stats(pop, n_births, self.cfg)
+        stats['has_child'] = has_child
         return pop, stats
 
-    def run_simulation(self, key, total_cycles, log_interval=10000, use_wandb=False, output_dir="output"):
+    def run_simulation(self, key, total_cycles, log_interval=10000, use_wandb=False, output_dir="output", toy_mode=False):
         """Run the simulation for total_cycles."""
         print(f"=== JAX PHYSIS SIMULATION ===")
         print(f"Population capacity: {self.cfg.pop_size}, Initial: {self.cfg.initial_pop}")
@@ -272,6 +273,42 @@ class Model:
         all_stats = []
         cycle_keys = random.split(k2, total_cycles)
 
+        # Set up logging for toy mode
+        toy_log_file = None
+        if toy_mode:
+            log_path = os.path.join(output_dir, "toy_example_logs.txt")
+            toy_log_file = open(log_path, "w")
+            
+            def format_genome(gen, length):
+                genes = [int(x) for x in gen[:length]]
+                names = [OP_NAMES.get(g, str(g)) for g in genes]
+                return f"[{', '.join(names)}]"
+            
+            # Initial state
+            init_ages = np.array(pop.age)
+            init_gests = np.array(pop.gestation_time)
+            init_statuses = np.array(pop.status)
+            init_has_child = np.array(pop.has_child)
+            init_genomes = np.array(pop.genome)
+            init_genome_lens = np.array(pop.genome_len)
+            init_alive = np.array(pop.alive)
+            init_exec_insts = np.array(pop.executed_instructions)
+            
+            init_log = "Initial Population State:\n"
+            for i in range(self.cfg.pop_size):
+                if init_alive[i]:
+                    genome_str = format_genome(init_genomes[i], init_genome_lens[i])
+                    init_log += (
+                        f"Initial State: Agent {i}, age: {init_ages[i]}, "
+                        f"gest: {init_gests[i]}, "
+                        f"exec_inst: {init_exec_insts[i]}, "
+                        f"status: {init_statuses[i]}, "
+                        f"has_child: {init_has_child[i]}, "
+                        f"genome: {genome_str}\n"
+                    )
+            print(init_log, end="")
+            toy_log_file.write(init_log)
+
         try:
             for chunk in trange(n_chunks, desc="Running"):
                 start = chunk * log_interval
@@ -303,6 +340,7 @@ class Model:
                     'alive': np.array(pop.alive),
                     'genome_len': np.array(pop.genome_len),
                     'gestation_time': np.array(pop.gestation_time),
+                    'executed_instructions': np.array(pop.executed_instructions),
                     'age': np.array(pop.age),
                     'hash': np.array(hash_vals),
                     'status': np.array(pop.status)
@@ -315,8 +353,41 @@ class Model:
                     'q_len': q_len,
                     'snapshot': snapshot
                 }
+                
+                # Stack has_child to stats as well
+                if 'has_child' in stats:
+                    chunk_rec['has_child'] = stats['has_child']
 
                 all_stats.append(chunk_rec)
+                
+                if toy_mode and toy_log_file is not None:
+                    curr_ages = np.array(pop.age)
+                    curr_gests = np.array(pop.gestation_time)
+                    curr_statuses = np.array(pop.status)
+                    # Use stats['has_child'] if available, else pop.has_child
+                    if 'has_child' in stats:
+                        curr_has_child = np.array(stats['has_child'][-1])
+                    else:
+                        curr_has_child = np.array(pop.has_child)
+                    curr_genomes = np.array(pop.genome)
+                    curr_genome_lens = np.array(pop.genome_len)
+                    curr_alive = np.array(pop.alive)
+                    curr_exec_insts = np.array(pop.executed_instructions)
+                    
+                    cycle_log = ""
+                    for i in range(self.cfg.pop_size):
+                        if curr_alive[i]:
+                            genome_str = format_genome(curr_genomes[i], curr_genome_lens[i])
+                            cycle_log += (
+                                f"Cycle {cycle_num}, Agent {i}, age: {curr_ages[i]}, "
+                                f"gest: {curr_gests[i]}, "
+                                f"exec_inst: {curr_exec_insts[i]}, "
+                                f"status: {curr_statuses[i]}, "
+                                f"has_child: {curr_has_child[i]}, "
+                                f"genome: {genome_str}\n"
+                            )
+                    print(cycle_log, end="")
+                    toy_log_file.write(cycle_log)
                     
         except KeyboardInterrupt:
             print("Simulation interrupted by user.")
@@ -327,6 +398,10 @@ class Model:
 
         if use_wandb:
             wandb.finish()
+            
+        if toy_log_file is not None:
+            toy_log_file.close()
+            print(f"Toy debug log written to {os.path.join(output_dir, 'toy_example_logs.txt')}")
             
         # Save all stats for later analysis
         stats_path = os.path.join(output_dir, "simulation_stats.pkl")

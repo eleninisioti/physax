@@ -162,6 +162,7 @@ class OpState(NamedTuple):
     already_alloc: jnp.ndarray
     child_l: jnp.ndarray
     gest_time: jnp.ndarray
+    exec_inst: jnp.ndarray
     has_ch: jnp.ndarray
     divide_returned: jnp.ndarray
     did_jump: jnp.ndarray
@@ -314,7 +315,7 @@ def get_opcode_functions(cfg: Config):
             state.se_vals
         )
         return state._replace(
-            gest_time=jnp.where(prolif_possible, args.cntr, state.gest_time),
+            exec_inst=jnp.where(prolif_possible, args.cntr, state.exec_inst),
             has_ch=jnp.where(prolif_possible, True, state.has_ch),
             divide_returned=jnp.bool_(True),
             se_vals=new_se_vals

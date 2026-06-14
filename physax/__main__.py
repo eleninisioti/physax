@@ -4,8 +4,7 @@ from jax import random
 from physax.config import make_config, PERCENTILES, UNCLASSIFIED
 from physax.model import Model
 from physax.agent import Agent
-from physax.visualization import plot_metrics, save_grid_gif, save_custom_3panel_gif
-from physax.genome_analysis import analyze_and_plot_top_genomes
+from physax.visualization import generate_all_visualizations
 import argparse
 import os
 
@@ -50,8 +49,8 @@ if __name__ == "__main__":
                     base_path = Path(val)
                     break
         
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = base_path / f"run_{timestamp}_{args.total_cycles}cycles"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    path = base_path / f"run_{args.total_cycles}_cycles_{timestamp}"
     path.mkdir(parents=True, exist_ok=True)
     print(f"\nSaving results to: {path}")
 
@@ -63,7 +62,8 @@ if __name__ == "__main__":
             total_cycles=args.total_cycles,
             log_interval=log_interval,
             use_wandb=False,
-            output_dir=str(path)
+            output_dir=str(path),
+            toy_mode=args.toy
         )
     except Exception as e:
         print(f"Unhandled exception in main: {e}")
@@ -78,19 +78,7 @@ if __name__ == "__main__":
     print(f"min={q_lens[0]:.0f}, lq={q_lens[1]:.1f}, med={q_lens[2]:.0f}, uq={q_lens[3]:.0f}, max={q_lens[4]:.0f}")
 
     if len(stats) > 0:
-        timestamps = [s['cycle'] for s in stats]
-        pop_sizes = [s['pop_size'] for s in stats]
-        births = [s['births'] for s in stats]
-        q_lens = [s['q_len'] for s in stats]
-
-        plot_metrics(timestamps, pop_sizes, births, q_lens, str(path / "simulation_metrics.png"))
-
-        snapshots = [s['snapshot'] for s in stats]
-        # save_grid_gif(snapshots, str(path / "evolution.gif"), cfg)
-        save_custom_3panel_gif(snapshots, str(path / "evolution_3panel.gif"), cfg)
-        
-        # Analyze and plot top genomes
-        top_hashes = analyze_and_plot_top_genomes(stats, str(path / "top_genomes.png"))
+        top_hashes = generate_all_visualizations(stats, path, cfg)
         
         from physax.model import global_self_replicating_genomes
         import numpy as np
