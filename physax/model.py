@@ -17,6 +17,69 @@ from physax.config import *
 from physax.agent import Agent
 from physax.virtual_machine import VirtualMachine
 from physax.genome_analysis import classify_genome, get_execution_route, compute_cycle_stats
+from typing import NamedTuple
+
+class GenomeDB(NamedTuple):
+    keys: jnp.ndarray
+    statuses: jnp.ndarray
+    gestations: jnp.ndarray
+    child_genomes: jnp.ndarray
+    child_lens: jnp.ndarray
+
+def init_genome_db(cfg: Config):
+    return GenomeDB(
+        keys=jnp.full(HASH_TABLE_SIZE + 1, EMPTY_KEY, dtype=jnp.int32),
+        statuses=jnp.full(HASH_TABLE_SIZE + 1, UNCLASSIFIED, dtype=jnp.int32),
+        gestations=jnp.full(HASH_TABLE_SIZE + 1, 2147483647, dtype=jnp.int32),
+        child_genomes=jnp.full((HASH_TABLE_SIZE + 1, cfg.max_genome_len), BLANK, dtype=jnp.int32),
+        child_lens=jnp.zeros(HASH_TABLE_SIZE + 1, dtype=jnp.int32)
+    )
+
+def lookup_db(hashes, db: GenomeDB):
+    def lookup_one(h):
+        def body_fn(i, state):
+            found, idx = state
+            probe_idx = (h + i) % HASH_TABLE_SIZE
+            key = db.keys[probe_idx]
+            is_match = (key == h) & (h != EMPTY_KEY)
+            new_found = found | is_match
+            new_idx = jnp.where(is_match & ~found, probe_idx, idx)
+            return new_found, new_idx
+        found, idx = lax.fori_loop(0, 32, body_fn, (jnp.bool_(False), jnp.int32(-1)))
+        return found, idx
+    return jax.vmap(lookup_one)(hashes)
+
+def add_to_db(db: GenomeDB, pop: Agent, mask: jnp.ndarray, cfg: Config):
+    def find_slot(h):
+        def body_fn(i, state):
+            found, idx = state
+            probe_idx = (h + i) % HASH_TABLE_SIZE
+            key = db.keys[probe_idx]
+            is_valid = (key == EMPTY_KEY) | (key == h)
+            new_found = found | is_valid
+            new_idx = jnp.where(is_valid & ~found, probe_idx, idx)
+            return new_found, new_idx
+        found, idx = lax.fori_loop(0, 32, body_fn, (jnp.bool_(False), jnp.int32(-1)))
+        return idx
+    
+    target_indices = jax.vmap(find_slot)(pop.genome_hash)
+    valid = mask & (target_indices != -1)
+    
+    safe_targets_for_match = jnp.where(valid, target_indices, jnp.arange(cfg.pop_size) + HASH_TABLE_SIZE + 1)
+    match_matrix = safe_targets_for_match[None, :] == safe_targets_for_match[:, None]
+    first_occurrence = jnp.argmax(match_matrix, axis=0) == jnp.arange(cfg.pop_size)
+    valid = valid & first_occurrence
+    
+    safe_targets = jnp.where(valid, target_indices, HASH_TABLE_SIZE)
+    
+    new_keys = db.keys.at[safe_targets].set(pop.genome_hash)
+    new_statuses = db.statuses.at[safe_targets].set(pop.status)
+    new_gestations = db.gestations.at[safe_targets].set(pop.gestation_time)
+    new_child_genomes = db.child_genomes.at[safe_targets].set(pop.child)
+    new_child_lens = db.child_lens.at[safe_targets].set(pop.child_len)
+    
+    return GenomeDB(keys=new_keys, statuses=new_statuses, gestations=new_gestations, 
+                    child_genomes=new_child_genomes, child_lens=new_child_lens)
 
 global_self_replicating_genomes = {}
 
@@ -118,10 +181,20 @@ class Model:
         )
         return new_pop, any_child_placed
 
-    def cycle_step(self, pop: Agent, key) -> tuple[Agent, dict]:
+    def cycle_step(self, pop: Agent, db: GenomeDB, key) -> tuple[Agent, GenomeDB, dict]:
         """Execute one cycle: step all organisms, handle births."""
 
         k_exec, k_birth, k_place = random.split(key, 3)
+
+        # 0. Check DB for unclassified/new agents
+        needs_lookup = pop.alive & (pop.status == UNCLASSIFIED)
+        found, db_idx = lookup_db(pop.genome_hash, db)
+        
+        apply_cache = needs_lookup & found
+        pop = pop._replace(
+            status=jnp.where(apply_cache, db.statuses[db_idx], pop.status),
+            gestation_time=jnp.where(apply_cache, db.gestations[db_idx], pop.gestation_time)
+        )
 
         # Determine execution routes based on genome classification
         routes = get_execution_route(pop.status)
@@ -129,21 +202,17 @@ class Model:
         is_slow = pop.alive & (routes == SLOW_TRACK)
 
         # 1. Execution Phase
-        # Fast Track: SELF_REPLICATING and NON_FERTILE
-        # NOTE: Genomes on the fast track are waiting for their execution cycles too 
-        # and are not written immediately! They age, and reproduce when age % gestation_time == 0.
+        # Fast Track
         fast_age = jnp.where(pop.alive & is_fast, pop.age + 1, pop.age)
+        fast_divide = pop.alive & is_fast & (pop.gestation_time > 0) & ((fast_age % pop.gestation_time) == 0) & (pop.status != NON_FERTILE)
         
-        is_self_replicating = pop.status == SELF_REPLICATING
-        fast_divide = pop.alive & is_self_replicating & (pop.gestation_time > 0) & ((fast_age % pop.gestation_time) == 0)
+        _, div_db_idx = lookup_db(pop.genome_hash, db)
         
         pop = pop._replace(
             age=fast_age,
             has_child=fast_divide,
-            # For SELF_REPLICATING genomes, child is exactly the parent genome. 
-            # We add children genomes here for fast trackers that are dividing.
-            child=jnp.where(fast_divide[:, None], pop.genome, pop.child),
-            child_len=jnp.where(fast_divide, pop.genome_len, pop.child_len),
+            child=jnp.where(fast_divide[:, None], db.child_genomes[div_db_idx], pop.child),
+            child_len=jnp.where(fast_divide, db.child_lens[div_db_idx], pop.child_len),
         )
         
         # Slow Track: UNCLASSIFIED, FERTILE, NON_STANDARD
@@ -167,7 +236,10 @@ class Model:
         newly_self_rep = pop.alive & (new_status == SELF_REPLICATING) & (pop.status != SELF_REPLICATING)
         jax.debug.callback(collect_self_replicating, pop.genome_hash, pop.genome, newly_self_rep)
         
+        just_classified = pop.alive & (new_status != UNCLASSIFIED) & (pop.status == UNCLASSIFIED)
         pop = pop._replace(status=new_status, gestation_time=new_gestation)
+        
+        db = add_to_db(db, pop, just_classified, self.cfg)
 
         # 4. Birth Phase (Mutation & Parsing)
         has_child = pop.has_child
@@ -228,7 +300,7 @@ class Model:
         # Stats
         stats = compute_cycle_stats(pop, n_births, self.cfg)
         stats['has_child'] = has_child
-        return pop, stats
+        return pop, db, stats
 
     def run_simulation(self, key, total_cycles, log_interval=10000, use_wandb=False, output_dir="output", toy_mode=False):
         """Run the simulation for total_cycles."""
@@ -261,11 +333,14 @@ class Model:
 
         k1, k2 = random.split(key)
         pop = self.init_population(k1)
+        db = init_genome_db(self.cfg)
 
-        def scan_cycles(pop_state, keys):
-            def step(p, k):
-                return self.cycle_step(p, k)
-            return lax.scan(step, pop_state, keys)
+        def scan_cycles(state, keys):
+            def step(carry, k):
+                p, d = carry
+                new_p, new_d, stats = self.cycle_step(p, d, k)
+                return (new_p, new_d), stats
+            return lax.scan(step, state, keys)
 
         jit_scan = jax.jit(scan_cycles)
 
@@ -315,8 +390,8 @@ class Model:
                 end = (chunk + 1) * log_interval
                 chunk_keys = cycle_keys[start:end]
 
-                pop, stats = jit_scan(pop, chunk_keys)
-                pop = jax.block_until_ready(pop)
+                (pop, db), stats = jit_scan((pop, db), chunk_keys)
+                (pop, db) = jax.block_until_ready((pop, db))
 
                 cycle_num = end
                 pop_size = int(stats['pop_size'][-1])

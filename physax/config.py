@@ -51,6 +51,9 @@ IFNOTZERO = 43
 UP_IS_SIZE = 44
 BLANK = -1
 
+HASH_TABLE_SIZE = 1048576 * 2
+EMPTY_KEY = -1
+
 OP_NAMES = {
     0: 'NOP', 1: 'IN', 2: 'OUT', 3: 'LOAD', 4: 'STORE', 5: 'MOVE', 6: 'ALLOCATE', 
     7: 'COMPARE', 8: 'IFZERO', 9: 'JUMP', 10: 'DEC', 11: 'INC', 12: 'DIVIDE', 
@@ -212,13 +215,7 @@ def tape_write(state: OpState, args: OpArgs, cfg: Config, position, value):
     child_idx = jnp.clip(pos - args.genome_len, 0, state.child_l - 1)
     in_child = ~in_parent & state.already_alloc
 
-    # Copy mutation: replace with random gene
-    k1, k2 = random.split(args.step_key)
-    do_mutate = random.uniform(k1) < cfg.copy_mutation_rate
-    mutated_value = random.randint(k2, (), 0, UP_IS_SIZE).astype(jnp.int32)
-    final_value = jnp.where(do_mutate & in_child, mutated_value, value)
-
-    new_child = jnp.where(in_child, state.child_arr.at[child_idx].set(final_value), state.child_arr)
+    new_child = jnp.where(in_child, state.child_arr.at[child_idx].set(value), state.child_arr)
     new_child_cop = jnp.where(in_child, state.child_cop.at[child_idx].set(True), state.child_cop)
 
     return state._replace(genome_arr=new_genome, child_arr=new_child, child_cop=new_child_cop)

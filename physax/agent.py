@@ -296,12 +296,11 @@ class Agent(NamedTuple):
         """
         k_copy_1, k_copy_2, k1, k2, k3, k4, k5, k6, k7 = random.split(key, 9)
 
-        # 0. Deferred copy mutation (only for SELF_REPLICATING)
-        is_self_replicating = status == SELF_REPLICATING
+        # 0. Deferred copy mutation (applied to all dividing agents)
         do_copy = random.uniform(k_copy_1, (cfg.max_genome_len,)) < cfg.copy_mutation_rate
         copy_vals = random.randint(k_copy_2, (cfg.max_genome_len,), 0, UP_IS_SIZE).astype(jnp.int32)
         valid_mask = jnp.arange(cfg.max_genome_len) < child_tape_len
-        child_tape = jnp.where(is_self_replicating & do_copy & valid_mask, copy_vals, child_tape)
+        child_tape = jnp.where(do_copy & valid_mask, copy_vals, child_tape)
 
         # 1. Point mutation
         do_point = random.uniform(k1) < cfg.divide_mutation_rate
