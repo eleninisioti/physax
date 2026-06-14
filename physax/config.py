@@ -143,11 +143,16 @@ def make_config(**kwargs) -> Config:
     return cfg
 
 
-# Caching Status
-WELL_BEHAVED = 0
-POORLY_BEHAVED = 1
-FAILED = 2
-UNCLASSIFIED = 3
+# Genome Classification Status
+UNCLASSIFIED = 0
+SELF_REPLICATING = 1
+FERTILE = 2
+NON_FERTILE = 3
+NON_STANDARD = 4
+
+# Execution Routes
+FAST_TRACK = 0
+SLOW_TRACK = 1
 
 class OpState(NamedTuple):
     se_vals: jnp.ndarray

@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
 from typing import NamedTuple
-from physax.config import Config, N_OPERANDS, UP_IS_SIZE, BLANK, I, SEP, R, S, Q, B, MOVE, NOP, CLEAR, INC, CINC, LOAD, IS_SEP, IFZERO, JUMP, ALLOCATE, REL_STORE, DEC, IFNOTZERO, DIVIDE, UNCLASSIFIED, WELL_BEHAVED, POORLY_BEHAVED, FAILED
+from physax.config import Config, N_OPERANDS, UP_IS_SIZE, BLANK, I, SEP, R, S, Q, B, MOVE, NOP, CLEAR, INC, CINC, LOAD, IS_SEP, IFZERO, JUMP, ALLOCATE, REL_STORE, DEC, IFNOTZERO, DIVIDE, UNCLASSIFIED, SELF_REPLICATING, FERTILE, NON_FERTILE, NON_STANDARD
 
 class Agent(NamedTuple):
     """Immutable state representation of a single organism."""
@@ -27,8 +27,6 @@ class Agent(NamedTuple):
     child_tape: jnp.ndarray
     child_tape_len: jnp.ndarray
     executed: jnp.ndarray
-    color: jnp.ndarray
-    child_color: jnp.ndarray
     read_from_child: jnp.ndarray
     status: jnp.ndarray
     genome_hash: jnp.ndarray
@@ -73,9 +71,6 @@ class Agent(NamedTuple):
             child_tape_len=jnp.int32(0),
             # Executed tracking (for fitness/merit computation)
             executed=jnp.zeros(cfg.max_genome_len, dtype=jnp.bool_),
-            # Visualization
-            color=jnp.zeros(3, dtype=jnp.float32),
-            child_color=jnp.zeros(3, dtype=jnp.float32),
             # Caching
             read_from_child=jnp.bool_(False),
             status=jnp.int32(UNCLASSIFIED),
@@ -114,7 +109,7 @@ class Agent(NamedTuple):
         return genome, genome_len
 
     @classmethod
-    def init_organism(cls, genome, genome_len, color, parent_hash, parent_status, parent_gestation, cfg: Config) -> "Agent":
+    def init_organism(cls, genome, genome_len, parent_hash, parent_status, parent_gestation, cfg: Config) -> "Agent":
         """Initialize a new living organism from a genome. 
         Parses the structure and instructions automatically."""
         parsed = cls._parse_genome(genome, genome_len, cfg)
@@ -124,17 +119,10 @@ class Agent(NamedTuple):
         
         hash_val = cls._hash_genome(genome, genome_len, cfg)
         
-        # Color agents based on genome hash
-        h = (jnp.float32(hash_val) * 0.618033988749895) % 1.0
-        s = jnp.float32(0.8)
-        v = jnp.float32(1.0)
-        derived_color = jnp.array([h, s, v])
-        
         state = cls.create_empty(cfg)
         return state._replace(
             genome=genome,
             genome_len=genome_len,
-            color=derived_color,
             alive=jnp.bool_(True),
             n_ses=parsed['n_ses'],
             separator_pos=parsed['separator_pos'],
@@ -305,12 +293,12 @@ class Agent(NamedTuple):
         """
         k_copy_1, k_copy_2, k1, k2, k3, k4, k5, k6, k7 = random.split(key, 9)
 
-        # 0. Deferred copy mutation (only for WELL_BEHAVED)
-        is_well_behaved = status == WELL_BEHAVED
+        # 0. Deferred copy mutation (only for SELF_REPLICATING)
+        is_self_replicating = status == SELF_REPLICATING
         do_copy = random.uniform(k_copy_1, (cfg.max_genome_len,)) < cfg.copy_mutation_rate
         copy_vals = random.randint(k_copy_2, (cfg.max_genome_len,), 0, UP_IS_SIZE).astype(jnp.int32)
         valid_mask = jnp.arange(cfg.max_genome_len) < child_tape_len
-        child_tape = jnp.where(is_well_behaved & do_copy & valid_mask, copy_vals, child_tape)
+        child_tape = jnp.where(is_self_replicating & do_copy & valid_mask, copy_vals, child_tape)
 
         # 1. Point mutation
         do_point = random.uniform(k1) < cfg.divide_mutation_rate

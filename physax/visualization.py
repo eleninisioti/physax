@@ -66,8 +66,12 @@ def save_grid_gif(snapshots, filename, cfg):
 
         alive_grid = np.pad(alive_mask, (0, pad_size), constant_values=False).reshape(grid_side, grid_side)
 
-        if cfg.use_species_color and 'color' in snap:
-            colors = snap['color']
+        if cfg.use_species_color and 'hash' in snap:
+            hashes = snap['hash']
+            h = (hashes.astype(np.float32) * 0.618033988749895) % 1.0
+            s = np.full_like(h, 0.8)
+            v = np.full_like(h, 1.0)
+            colors = np.stack([h, s, v], axis=-1)
             colors_padded = np.pad(colors, ((0, pad_size), (0, 0)), constant_values=0.0)
             hsv_grid = colors_padded.reshape(grid_side, grid_side, 3)
             rgb = mcolors.hsv_to_rgb(hsv_grid)
@@ -227,4 +231,132 @@ def save_physis_view_gif(snapshots, filename, cfg, view_mode='all'):
     print(f"Saved physis-view GIF to {filename}")
 
 
+def save_custom_3panel_gif(snapshots, filename, cfg):
+    """Generate a GIF with three panels:
+    1) Unique Hash Color
+    2) Time to reproduce (gestation_time) gradient
+    3) Age gradient
+    """
+    if not imageio:
+        print("imageio not installed, cannot save GIF.")
+        return
 
+    print("Generating custom 3-panel GIF...")
+    grid_side = int(np.ceil(np.sqrt(cfg.pop_size)))
+    pad_size = grid_side * grid_side - cfg.pop_size
+
+    # # Compute max values for normalizations
+    # max_gestation = 1.0
+    
+    # for snap in snapshots:
+    #     alive = snap.get('alive', np.array([]))
+    #     gest = snap.get('gestation_time', np.array([]))
+    #     age = snap.get('age', np.array([]))
+        
+    #     if len(alive) > 0 and np.any(alive):
+    #         valid_gest = gest[alive]
+    #         valid_gest = valid_gest[valid_gest < 2000000000]
+    #         if len(valid_gest) > 0:
+    #             max_gestation = max(max_gestation, float(np.max(valid_gest)))
+    # Use fixed max gestation of 21 cycles
+    max_gestation = 21.0
+
+    frames = []
+    
+    for pi, snap in enumerate(snapshots):
+        alive = snap.get('alive', np.array([]))
+        if len(alive) == 0:
+            continue
+            
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        dead_mask = ~alive
+        
+        # Panel 1: Unique Hash
+        ax_hash = axes[0]
+        hash_vals = snap.get('hash', np.zeros_like(alive, dtype=np.uint32))
+        
+        # Map hash to RGB using 'hsv' colormap
+        cmap_hash = plt.get_cmap('hsv')
+        normed_hash = (hash_vals % 1000) / 1000.0
+        rgba_hash = cmap_hash(normed_hash)
+        rgb_hash = rgba_hash[..., :3]
+        rgb_hash[dead_mask] = [0.0, 0.0, 0.0]
+        
+        grid_hash = np.pad(rgb_hash, ((0, pad_size), (0, 0)), constant_values=0.0).reshape(grid_side, grid_side, 3)
+        ax_hash.imshow(grid_hash, interpolation='nearest', aspect='equal')
+        ax_hash.set_title("Unique Genome Hash")
+        ax_hash.axis('off')
+        
+        # Panel 2: Gestation Time
+        ax_gest = axes[1]
+        gest = snap.get('gestation_time', np.zeros_like(alive, dtype=float)).copy()
+        
+        cmap_gest = plt.get_cmap('plasma')
+        gest_mask = (gest < 2000000000) & alive
+        normed_gest = np.zeros_like(gest)
+        # Normalize between 1 and max_gestation
+        normed_gest[gest_mask] = np.clip((gest[gest_mask] - 1) / (max_gestation - 1), 0, 1)
+        
+        rgba_gest = cmap_gest(normed_gest)
+        rgb_gest = rgba_gest[..., :3]
+        
+        not_reproduced = (gest >= 2000000000) & alive
+        rgb_gest[not_reproduced] = [0.25, 0.25, 0.25] # grey
+        rgb_gest[dead_mask] = [0.0, 0.0, 0.0]
+        
+        grid_gest = np.pad(rgb_gest, ((0, pad_size), (0, 0)), constant_values=0.0).reshape(grid_side, grid_side, 3)
+        im_gest = ax_gest.imshow(grid_gest, interpolation='nearest', aspect='equal')
+        ax_gest.set_title("Time to Reproduce")
+        ax_gest.axis('off')
+        
+        # Add colorbar for gestation
+        sm_gest = plt.cm.ScalarMappable(cmap=cmap_gest, norm=plt.Normalize(vmin=1, vmax=max_gestation))
+        sm_gest.set_array([])
+        cb_gest = fig.colorbar(sm_gest, ax=ax_gest, fraction=0.046, pad=0.04, format='%d')
+        cb_gest.set_label("Cycles", size=16)
+        cb_gest.ax.tick_params(labelsize=14)
+        
+        # Panel 3: Category (Status)
+        ax_stat = axes[2]
+        status = snap.get('status', np.zeros_like(alive, dtype=int))
+        
+        # Colors: 0=Grey(Unclassified), 1=Green(SelfReplicating), 2=Blue(Fertile), 3=Brown(NonFertile), 4=Orange(NonStandard)
+        rgb_stat = np.zeros((*status.shape, 3), dtype=float)
+        rgb_stat[status == 0] = [0.5, 0.5, 0.5]  # UNCLASSIFIED
+        rgb_stat[status == 1] = [0.2, 0.8, 0.2]  # SELF_REPLICATING
+        rgb_stat[status == 2] = [0.2, 0.2, 0.8]  # FERTILE
+        rgb_stat[status == 3] = [0.6, 0.4, 0.2]  # NON_FERTILE
+        rgb_stat[status == 4] = [1.0, 0.6, 0.0]  # NON_STANDARD
+        rgb_stat[dead_mask] = [0.0, 0.0, 0.0]
+        
+        grid_stat = np.pad(rgb_stat, ((0, pad_size), (0, 0)), constant_values=0.0).reshape(grid_side, grid_side, 3)
+        ax_stat.imshow(grid_stat, interpolation='nearest', aspect='equal')
+        ax_stat.set_title("Agent Category")
+        ax_stat.axis('off')
+        
+        # Custom legend for categories
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor=[0.5, 0.5, 0.5], label='Unclassified'),
+            Patch(facecolor=[0.2, 0.8, 0.2], label='Self Replicating'),
+            Patch(facecolor=[0.2, 0.2, 0.8], label='Fertile'),
+            Patch(facecolor=[0.6, 0.4, 0.2], label='Non Fertile'),
+            Patch(facecolor=[1.0, 0.6, 0.0], label='Non Standard')
+        ]
+        ax_stat.legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.05, 0.5), fontsize=12)
+        
+        fig.suptitle(f"Cycle {snap['cycle']} | Pop: {np.sum(alive)}/{cfg.pop_size}", fontsize=14)
+        fig.tight_layout()
+        
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.1)
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(np.array(Image.open(buf).convert('RGB')))
+
+        if (pi + 1) % 20 == 0:
+            print(f"  Frame {pi + 1}/{len(snapshots)}")
+
+    imageio.mimsave(filename, frames, fps=10)
+    print(f"Saved custom 3-panel GIF to {filename}")

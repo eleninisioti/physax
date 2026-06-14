@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import jax.lax as lax
 from jax import random
-from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, OpState, OpArgs, get_opcode_functions, tape_read, FAILED, WELL_BEHAVED, POORLY_BEHAVED, UNCLASSIFIED
+from physax.config import Config, N_OPERANDS, BLANK, NOP, UP_IS_SIZE, OpState, OpArgs, get_opcode_functions, tape_read, UNCLASSIFIED
 from physax.agent import Agent
 
 
