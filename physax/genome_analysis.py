@@ -70,7 +70,7 @@ def compute_cycle_stats(pop, n_births, cfg: Config):
         'q_genome_len': q_genome_len,
     }
 
-def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
+def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png", start_cycle=0, only_self_replicators=True):
     """
     Analyze the saved chunk records, extract the prevalence of self-replicating 
     genomes over time, and plot the top 10 most frequent ones.
@@ -87,6 +87,8 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
     
     for chunk in all_stats:
         cycle = chunk['cycle']
+        if cycle < start_cycle:
+            continue
         cycles.append(cycle)
         snap = chunk['snapshot']
         
@@ -95,7 +97,10 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
         hashes = snap['hash']
         gest_times = snap['gestation_time']
         
-        alive_self_rep_mask = alive & (status != UNCLASSIFIED) & (status != NON_FERTILE)
+        if only_self_replicators:
+            alive_self_rep_mask = alive & (status == SELF_REPLICATING)
+        else:
+            alive_self_rep_mask = alive & (status != UNCLASSIFIED) & (status != NON_FERTILE)
         valid_hashes = hashes[alive_self_rep_mask]
         valid_gest = gest_times[alive_self_rep_mask]
         
@@ -135,7 +140,7 @@ def analyze_and_plot_top_genomes(all_stats, filename="top_genomes.png"):
         
     plt.xlabel("Cycle")
     plt.ylabel("Population Count")
-    plt.title(f"Top {top_n} Self-Replicating Genomes Over Time")
+    plt.title(f"Top {top_n} {'Self-Replicating' if only_self_replicators else 'All Fertile'} Genomes Over Time")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

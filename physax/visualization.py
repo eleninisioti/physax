@@ -518,7 +518,14 @@ def generate_all_visualizations(stats, output_dir, cfg=None):
     plot_gestation_and_diversity(stats, str(path / "gestation_diversity.png"))
     
     # Analyze and plot top genomes
-    top_hashes = analyze_and_plot_top_genomes(stats, str(path / "top_genomes.png"))
+    top_hashes = analyze_and_plot_top_genomes(stats, str(path / "top_genomes_self_replicators.png"), only_self_replicators=True)
+    _ = analyze_and_plot_top_genomes(stats, str(path / "top_genomes_all_fertile.png"), only_self_replicators=False)
+    max_cycle = 10_000
+    if stats[-1]['cycle'] > max_cycle:
+        _ = analyze_and_plot_top_genomes(stats, str(path / f"top_genomes_after_{max_cycle}_cycles_self_replicators.png"), 
+                                         start_cycle=max_cycle, only_self_replicators=True)
+        _ = analyze_and_plot_top_genomes(stats, str(path / f"top_genomes_after_{max_cycle}_cycles_all_fertile.png"),
+                                         start_cycle=max_cycle, only_self_replicators=False)
     return top_hashes
 
 if __name__ == "__main__":
