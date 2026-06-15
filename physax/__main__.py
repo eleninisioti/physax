@@ -81,14 +81,18 @@ if __name__ == "__main__":
     if len(stats) > 0:
         top_hashes = generate_all_visualizations(stats, path, cfg)
         
-        from physax.model import global_self_replicating_genomes
+        from physax.model import global_self_replicating_genomes, global_fertile_genomes
         import numpy as np
         
         all_genomes_dict = {str(h): g for h, g in global_self_replicating_genomes.items()}
-                
         if all_genomes_dict:
-            np.savez(str(path / "genomes_details.npz"), **all_genomes_dict)
+            np.savez(str(path / "self_replicating_genomes_details.npz"), **all_genomes_dict)
             print(f"Saved {len(all_genomes_dict)} self-replicating genomes to genomes_details.npz")
+
+        fertile_genomes_dict = {str(h): g for h, g in global_fertile_genomes.items()}
+        if fertile_genomes_dict:
+            np.savez(str(path / "fertile_genomes_details.npz"), **fertile_genomes_dict)
+            print(f"Saved {len(fertile_genomes_dict)} fertile genomes to fertile_genomes_details.npz")
     else:
         print("No stats collected, skipping plots and saves.")
     

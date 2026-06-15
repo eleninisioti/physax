@@ -277,33 +277,59 @@ if __name__ == "__main__":
         print(f"Auto-selected most recent run: {folder_path}")
         
     npz_path = folder_path / "genomes_details.npz"
-    if not npz_path.exists():
-        print(f"Error: Could not find genomes details file: {npz_path}")
+    fertile_npz_path = folder_path / "fertile_genomes_details.npz"
+    if not npz_path.exists() and not fertile_npz_path.exists():
+        print(f"Error: Could not find genomes details files: {npz_path} or {fertile_npz_path}")
         sys.exit(1)
         
     # Check if hash was provided
     if args.hash is None:
         print("Error: --hash parameter is required.")
-        try:
-            genomes_data = np.load(npz_path)
-            keys_list = list(genomes_data.keys())
-            print(f"There are {len(keys_list)} self-replicating genome hashes saved in this run.")
-            print("Here are the first 20 available hashes:")
-            print(keys_list[:20])
-        except Exception as e:
-            print(f"Error loading {npz_path}: {e}")
+        if npz_path.exists():
+            try:
+                genomes_data = np.load(npz_path)
+                keys_list = list(genomes_data.keys())
+                print(f"There are {len(keys_list)} self-replicating genome hashes saved in this run.")
+                print("Here are the first 20 available self-replicating hashes:")
+                print(keys_list[:20])
+            except Exception as e:
+                print(f"Error loading {npz_path}: {e}")
+        if fertile_npz_path.exists():
+            try:
+                fertile_data = np.load(fertile_npz_path)
+                keys_list = list(fertile_data.keys())
+                print(f"There are {len(keys_list)} fertile genome hashes saved in this run.")
+                print("Here are the first 20 available fertile hashes:")
+                print(keys_list[:20])
+            except Exception as e:
+                print(f"Error loading {fertile_npz_path}: {e}")
         sys.exit(1)
         
-    print(f"Loading genome {args.hash} from {npz_path}...")
-    try:
-        genomes_data = np.load(npz_path)
-    except Exception as e:
-        print(f"Error loading {npz_path}: {e}")
-        sys.exit(1)
-        
+    # Load from genomes_details.npz or fertile_genomes_details.npz
+    genomes_data = None
+    npz_used_path = None
     hash_str = str(args.hash)
-    if hash_str not in genomes_data:
-        print(f"Error: Genome hash '{args.hash}' not found in genomes_details.npz.")
+    
+    if npz_path.exists():
+        try:
+            data = np.load(npz_path)
+            if hash_str in data:
+                genomes_data = data
+                npz_used_path = npz_path
+        except Exception as e:
+            pass
+            
+    if genomes_data is None and fertile_npz_path.exists():
+        try:
+            data = np.load(fertile_npz_path)
+            if hash_str in data:
+                genomes_data = data
+                npz_used_path = fertile_npz_path
+        except Exception as e:
+            pass
+            
+    if genomes_data is None:
+        print(f"Error: Genome hash '{args.hash}' not found in genomes_details.npz or fertile_genomes_details.npz.")
         
         # Try to search simulation_stats.pkl to explain the status of this hash
         stats_file = folder_path / "simulation_stats.pkl"
@@ -326,17 +352,32 @@ if __name__ == "__main__":
                     status_names = {0: "UNCLASSIFIED", 1: "SELF_REPLICATING", 2: "FERTILE", 3: "NON_FERTILE", 4: "NON_STANDARD"}
                     status_strs = [status_names.get(s, str(s)) for s in unique_statuses]
                     print(f"\n  Note: Hash {args.hash} was found in the simulation history with status: {', '.join(status_strs)}.")
-                    print("  Only SELF_REPLICATING (status 1) genomes are saved to genomes_details.npz.")
-                    print("  Genomes with status FERTILE (status 2) or UNCLASSIFIED (status 0) do not have their sequences stored.\n")
+                    print("  Only SELF_REPLICATING (status 1) and FERTILE (status 2) genomes are saved.")
+                    print("  Genomes with status UNCLASSIFIED (status 0), NON_FERTILE (status 3) or NON_STANDARD (status 4) do not have their sequences stored.\n")
             except Exception as e:
                 pass
                 
-        keys_list = list(genomes_data.keys())
-        print(f"There are {len(keys_list)} self-replicating genome hashes saved in this run.")
-        print("Here are the first 20 available hashes:")
-        print(keys_list[:20])
+        if npz_path.exists():
+            try:
+                genomes_data = np.load(npz_path)
+                keys_list = list(genomes_data.keys())
+                print(f"There are {len(keys_list)} self-replicating genome hashes saved in this run.")
+                print("Here are the first 20 available self-replicating hashes:")
+                print(keys_list[:20])
+            except Exception as e:
+                pass
+        if fertile_npz_path.exists():
+            try:
+                fertile_data = np.load(fertile_npz_path)
+                keys_list = list(fertile_data.keys())
+                print(f"There are {len(keys_list)} fertile genome hashes saved in this run.")
+                print("Here are the first 20 available fertile hashes:")
+                print(keys_list[:20])
+            except Exception as e:
+                pass
         sys.exit(1)
         
+    print(f"Loading genome {args.hash} from {npz_used_path}...")
     genome_arr = genomes_data[hash_str]
     
     run_illustration(genome_arr, args.hash, folder_path, args.max_steps)

@@ -82,6 +82,7 @@ def add_to_db(db: GenomeDB, pop: Agent, mask: jnp.ndarray, cfg: Config):
                     child_genomes=new_child_genomes, child_lens=new_child_lens)
 
 global_self_replicating_genomes = {}
+global_fertile_genomes = {}
 
 def collect_self_replicating(hashes, genomes, mask):
     hashes_np = np.array(hashes)
@@ -92,6 +93,16 @@ def collect_self_replicating(hashes, genomes, mask):
         h = int(hashes_np[idx])
         if h not in global_self_replicating_genomes:
             global_self_replicating_genomes[h] = np.copy(genomes_np[idx])
+
+def collect_fertile(hashes, genomes, mask):
+    hashes_np = np.array(hashes)
+    genomes_np = np.array(genomes)
+    mask_np = np.array(mask)
+    valid_indices = np.where(mask_np)[0]
+    for idx in valid_indices:
+        h = int(hashes_np[idx])
+        if h not in global_fertile_genomes:
+            global_fertile_genomes[h] = np.copy(genomes_np[idx])
 
 class Model:
     """Simulation manager tying together configuration, VM, and Agent population."""
@@ -236,6 +247,9 @@ class Model:
         newly_self_rep = pop.alive & (new_status == SELF_REPLICATING) & (pop.status != SELF_REPLICATING)
         jax.debug.callback(collect_self_replicating, pop.genome_hash, pop.genome, newly_self_rep)
         
+        newly_fertile = pop.alive & (new_status == FERTILE) & (pop.status != FERTILE)
+        jax.debug.callback(collect_fertile, pop.genome_hash, pop.genome, newly_fertile)
+        
         just_classified = pop.alive & (new_status != UNCLASSIFIED) & (pop.status == UNCLASSIFIED)
         pop = pop._replace(status=new_status, gestation_time=new_gestation)
         
@@ -330,6 +344,9 @@ class Model:
                         "divide_delete_rate": self.cfg.divide_delete_rate,
                     }
                 )
+
+        global_self_replicating_genomes.clear()
+        global_fertile_genomes.clear()
 
         k1, k2 = random.split(key)
         pop = self.init_population(k1)
